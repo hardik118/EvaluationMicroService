@@ -3,6 +3,8 @@ package com.example.demo.kafka;
 import com.example.demo.model.EvaluationRequest;
 import com.example.demo.service.RepositoryEvaluatorService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.stereotype.Service;
 
@@ -10,6 +12,7 @@ import java.nio.file.Path;
 
 @Service
 public class EvaluationRetryConsumer {
+    private static final Logger logger = LoggerFactory.getLogger(EvaluationRetryConsumer.class);
 
     private final RepositoryEvaluatorService evaluationService;
     private  final ObjectMapper objectMapper;
@@ -26,6 +29,7 @@ public class EvaluationRetryConsumer {
 
 try {
     EvaluationRequest evaluationRequest= objectMapper.readValue(msg, EvaluationRequest.class);
+    logger.info("Request is now being processed in retry pipeline : {}", evaluationRequest);
 
     evaluationService.evaluateRepository(Path.of(evaluationRequest.getRepoUrl()), evaluationRequest.getSubmissionId());
 

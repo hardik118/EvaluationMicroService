@@ -6,8 +6,11 @@ import com.example.demo.kafka.FeedbackProducer;
 import com.example.demo.model.*;
 import com.example.demo.utils.*;
 import lombok.extern.slf4j.Slf4j;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.ProducerFactory;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -27,6 +30,7 @@ import java.util.concurrent.*;
 @Service
 public class RepositoryEvaluatorService {
 
+    private final ProducerFactory producerFactory;
     @Value("${groq.api.key}")
     private String groqApiKey;
 
@@ -40,14 +44,18 @@ public class RepositoryEvaluatorService {
     private final GroqClient groqClient;
     private final GitUtils gitService;
     private  final  FeedbackProducer feedbackProducer;
+    private static final Logger logger = LoggerFactory.getLogger(RepositoryEvaluatorService.class);
+
 
     @Autowired
-    public RepositoryEvaluatorService(GitUtils gitService, FeedbackProducer feedbackProducer) {
+    public RepositoryEvaluatorService(GitUtils gitService, FeedbackProducer feedbackProducer, ProducerFactory producerFactory) {
+
         // Initialize components
         this.dependencyAnalyzer = new DependencyCheckAnalyzer();
         this.groqClient = new GroqClient(groqApiKey);
         this.gitService = gitService;
         this.feedbackProducer= feedbackProducer;
+        this.producerFactory = producerFactory;
     }
 
     /**
@@ -73,7 +81,8 @@ public class RepositoryEvaluatorService {
 
             // Evaluate the cloned repository
              EvaluationResult evaluationResult=  evaluateRepository(repoPath, submissionId);
-            System.out.println(evaluationResult);
+            logger.info("Evaluation result: {}", evaluationResult);
+            feedbackProducer.produceFeedback(evaluationResult);
 
 
         } catch (GitUtils.GitServiceException e) {
