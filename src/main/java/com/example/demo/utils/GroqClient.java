@@ -1,172 +1,137 @@
 package com.example.demo.utils;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.annotation.JsonProperty;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
 
+import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
+import java.util.Locale;
+import java.util.concurrent.ThreadLocalRandom;
 
-/**
- * Client for interacting with the Groq API
- */
 public class GroqClient {
-    private static final String GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
-    private static final String MODEL_NAME = "llama3-8b-8192";
-    private static final int MAX_TOKENS = 4096;
-    private static final double TEMPERATURE = 0.2;
+
+    private static final String ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
+    private static final String MODEL = "llama3-8b-8192";
 
     private final String apiKey;
-    private final HttpClient httpClient;
-    private final ObjectMapper objectMapper;
+    private final HttpClient http;
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    // Simple retry/backoff settings
+    private final int maxRetries = 5;
+    private final Duration requestTimeout = Duration.ofSeconds(60);
 
     public GroqClient(String apiKey) {
+        if (apiKey == null || apiKey.isBlank()) {
+            throw new IllegalArgumentException("groq.api.key is missing");
+        }
         this.apiKey = apiKey;
-        this.httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(30))
+        this.http = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(15))
                 .build();
-        this.objectMapper = new ObjectMapper();
     }
 
-    /**
-     * Get a completion from the Groq API
-     *
-     * @param prompt The prompt to send
-     * @return The model's response
-     */
-    public String getCompletion(String prompt) throws Exception {
-        // Create the request payload
-        GroqRequest request = new GroqRequest(
-                MODEL_NAME,
-                Collections.singletonList(new Message("user", prompt)),
-                MAX_TOKENS,
-                TEMPERATURE,
-                true
-        );
-
-        String requestBody = objectMapper.writeValueAsString(request);
-
-        // Build the HTTP request
-        HttpRequest httpRequest = HttpRequest.newBuilder()
-                .uri(URI.create(GROQ_API_URL))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
-                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-                .build();
-
-        // Send the request
-        HttpResponse<String> response = httpClient.send(
-                httpRequest,
-                HttpResponse.BodyHandlers.ofString()
-        );
-
-        // Check for errors
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("Groq API error: " + response.body());
-        }
-
-        // Parse the response
-        GroqResponse groqResponse = objectMapper.readValue(response.body(), GroqResponse.class);
-
-        // Extract the content
-        if (groqResponse.getChoices() != null && !groqResponse.getChoices().isEmpty()) {
-            return groqResponse.getChoices().get(0).getMessage().getContent();
-        } else {
-            throw new RuntimeException("No content in Groq API response");
-        }
+    public String getCompletion(String prompt) {
+        // Default caps; override if you want via additional params
+        return getCompletion(prompt, 512, 0.2);
     }
 
-    /**
-     * Asynchronously get a completion from the Groq API
-     */
-    public CompletableFuture<String> getCompletionAsync(String prompt) {
-        return CompletableFuture.supplyAsync(() -> {
+    public String getCompletion(String prompt, int maxTokens, double temperature) {
+        int attempt = 0;
+        while (true) {
+            attempt++;
             try {
-                return getCompletion(prompt);
-            } catch (Exception e) {
-                throw new RuntimeException("Error getting completion", e);
+                String body = """
+                        {
+                          "model": "%s",
+                          "messages": [
+                            {"role": "user", "content": %s}
+                          ],
+                          "max_tokens": %d,
+                          "temperature": %s,
+                          "stream": false
+                        }
+                        """.formatted(
+                        MODEL,
+                        mapper.writeValueAsString(prompt),
+                        maxTokens,
+                        String.valueOf(temperature)
+                );
+
+                HttpRequest req = HttpRequest.newBuilder()
+                        .uri(URI.create(ENDPOINT))
+                        .timeout(requestTimeout)
+                        .header("Authorization", "Bearer " + apiKey)
+                        .header("Content-Type", "application/json")
+                        .POST(HttpRequest.BodyPublishers.ofString(body))
+                        .build();
+
+                HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+
+                if (resp.statusCode() == 200) {
+                    JsonNode root = mapper.readTree(resp.body());
+                    JsonNode choices = root.path("choices");
+                    if (choices.isArray() && choices.size() > 0) {
+                        String content = choices.get(0).path("message").path("content").asText("");
+                        return content != null ? content : "";
+                    }
+                    throw new RuntimeException("Groq API response missing choices");
+                }
+
+                // Non-200: try to parse error JSON
+                String bodyText = resp.body() == null ? "" : resp.body();
+                String lower = bodyText.toLowerCase(Locale.ROOT);
+
+                // Handle rate limit/backoff; Groq returns helpful wait seconds in message
+                if (resp.statusCode() == 429 || lower.contains("rate_limit_exceeded")) {
+                    double waitSec = parseWaitSeconds(bodyText);
+                    if (attempt <= maxRetries) {
+                        // jitter 0–300ms
+                        long sleepMs = (long) ((waitSec > 0 ? waitSec : 1.0) * 1000
+                                + ThreadLocalRandom.current().nextInt(0, 300));
+                        Thread.sleep(sleepMs);
+                        continue;
+                    }
+                }
+
+                // Request too large or other error
+                throw new RuntimeException("Groq API error: " + bodyText);
+
+            } catch (IOException | InterruptedException e) {
+                if (attempt >= maxRetries) {
+                    throw new RuntimeException("Groq API request failed after retries: " + e.getMessage(), e);
+                }
+                // basic exponential backoff with jitter
+                try {
+                    Thread.sleep(200L * (1L << (attempt - 1)) + ThreadLocalRandom.current().nextInt(0, 200));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Interrupted during backoff", ie);
+                }
             }
-        });
+        }
     }
 
-    /**
-     * Request model for Groq API
-     */
-    @Data
-    @NoArgsConstructor
-    @AllArgsConstructor
-    private static class GroqRequest {
-        private String model;
-        private List<Message> messages;
-
-        @JsonProperty("max_tokens")
-        private int maxTokens;
-
-        private double temperature;
-
-        @JsonProperty("stream")
-        private boolean isStream;
-    }
-
-    /**
-     * Response model from Groq API
-     */
-    @Data
-    @NoArgsConstructor
-    public static class GroqResponse {
-        private String id;
-        private String object;
-        private long created;
-        private String model;
-        private List<Choice> choices;
-        private Usage usage;
-    }
-
-    /**
-     * Message in the conversation
-     */
-    @Data
-    @NoArgsConstructor
-    @AllArgsConstructor
-    public static class Message {
-        private String role;
-        private String content;
-    }
-
-    /**
-     * Choice in the response
-     */
-    @Data
-    @NoArgsConstructor
-    public static class Choice {
-        private int index;
-        private Message message;
-
-        @JsonProperty("finish_reason")
-        private String finishReason;
-    }
-
-    /**
-     * Token usage information
-     */
-    @Data
-    @NoArgsConstructor
-    public static class Usage {
-        @JsonProperty("prompt_tokens")
-        private int promptTokens;
-
-        @JsonProperty("completion_tokens")
-        private int completionTokens;
-
-        @JsonProperty("total_tokens")
-        private int totalTokens;
+    private double parseWaitSeconds(String errorBody) {
+        // Try to extract “Please try again in X.s” from Groq error message
+        if (errorBody == null) return 0;
+        try {
+            JsonNode root = mapper.readTree(errorBody);
+            String msg = root.path("error").path("message").asText("");
+            if (msg == null) return 0;
+            // look for a number followed by 's'
+            var m = java.util.regex.Pattern.compile("try again in ([0-9]+\\.?[0-9]*)s", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(msg);
+            if (m.find()) {
+                return Double.parseDouble(m.group(1));
+            }
+        } catch (Exception ignored) {
+            // if body is not JSON, ignore
+        }
+        return 0;
     }
 }

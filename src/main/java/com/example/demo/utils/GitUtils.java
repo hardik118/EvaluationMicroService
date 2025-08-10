@@ -1,143 +1,101 @@
 package com.example.demo.utils;
 
-
-import lombok.extern.slf4j.Slf4j;
 import org.eclipse.jgit.api.Git;
-import org.eclipse.jgit.api.errors.GitAPIException;
+import org.eclipse.jgit.transport.CredentialsProvider;
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Component;
 
-import java.io.File;
 import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 
-@Slf4j
-@Service
+@Component
 public class GitUtils {
 
-    @Value("${repo.evaluator.clone.directory:#{systemProperties['java.io.tmpdir']}/repo-evaluator}")
-    private String baseCloneDirectory;
+    private static final Logger log = LoggerFactory.getLogger(GitUtils.class);
 
-    /**
-     * Clone a Git repository from a URL to a directory
-     *
-     * @param repoUrl URL of the Git repository to clone
-     * @return Path to the cloned repository
-     * @throws GitServiceException if cloning fails
-     */
-    public Path cloneRepository(String repoUrl) throws GitServiceException {
+    @Value("${evaluator.git.username:}")
+    private String gitUsername;
+
+    @Value("${evaluator.git.passwordOrToken:}")
+    private String gitPasswordOrToken;
+
+    public Path cloneRepository(String rawUrl) {
+        String repoUrl = normalizeUrl(rawUrl);
+        ensureHttpOrSshUrl(repoUrl);
+
         try {
-            // Create base directory if it doesn't exist
-            Path baseDir = Paths.get(baseCloneDirectory);
-            if (!Files.exists(baseDir)) {
-                Files.createDirectories(baseDir);
-                log.info("Created base directory: {}", baseDir);
+            Path tempDir = Files.createTempDirectory("repo-eval-");
+            log.info("Cloning {} into {}", repoUrl, tempDir.toAbsolutePath());
+
+            CredentialsProvider creds = null;
+            if (!gitUsername.isBlank() && !gitPasswordOrToken.isBlank()) {
+                creds = new UsernamePasswordCredentialsProvider(gitUsername, gitPasswordOrToken);
             }
 
-            // Extract repo name from URL
-            String repoName = extractRepoName(repoUrl);
-
-            // Create timestamp for directory name
-            String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));
-
-            // Create a unique directory with repo name and timestamp
-            String dirName = String.format("%s-%s", repoName, timestamp);
-            Path repoDir = baseDir.resolve(dirName);
-            Files.createDirectories(repoDir);
-
-            // Clone the repository
-            log.info("Cloning repository: {} to {}", repoUrl, repoDir);
-            Git.cloneRepository()
+            try (Git git = Git.cloneRepository()
                     .setURI(repoUrl)
-                    .setDirectory(repoDir.toFile())
-                    .setCloneAllBranches(false) // Only clone default branch
-                    .setCloneSubmodules(false)  // Skip submodules for faster cloning
-                    .call();
+                    .setDirectory(tempDir.toFile())
+                    .setCloneAllBranches(false)
+                    .setDepth(1)
+                    .setCredentialsProvider(creds)
+                    .call()) {
+                // Clone complete
+            }
 
-            log.info("Repository cloned to: {}", repoDir);
-            return repoDir;
+            // Sanity check
+            if (!Files.isDirectory(tempDir)) {
+                throw new GitServiceException("Clone succeeded but directory missing: " + tempDir);
+            }
+            return tempDir;
+        } catch (Exception e) {
+            throw new GitServiceException("Failed to clone " + repoUrl + ": " + e.getMessage(), e);
+        }
+    }
 
+    public void cleanupRepository(Path repoDir) {
+        if (repoDir == null) return;
+        try {
+            // Recursively delete the temp directory
+            Files.walk(repoDir)
+                    .sorted((a, b) -> b.compareTo(a))
+                    .forEach(p -> {
+                        try { Files.deleteIfExists(p); } catch (IOException ignored) {}
+                    });
         } catch (IOException e) {
-            throw new GitServiceException("Failed to create directory for repository", e);
-        } catch (GitAPIException e) {
-            throw new GitServiceException("Failed to clone repository: " + e.getMessage(), e);
+            log.warn("Failed to cleanup repo dir {}: {}", repoDir, e.getMessage());
         }
     }
 
-    /**
-     * Extract repository name from URL
-     */
-    private String extractRepoName(String repoUrl) {
-        String name = repoUrl.trim();
-
-        // Remove trailing .git if present
-        if (name.endsWith(".git")) {
-            name = name.substring(0, name.length() - 4);
+    private String normalizeUrl(String input) {
+        if (input == null) throw new GitServiceException("Repository URL is null");
+        if (input.startsWith("https:/") && !input.startsWith("https://")) {
+            String fixed = input.replaceFirst("^https:/+", "https://");
+            log.warn("Normalized malformed URL from {} to {}", input, fixed);
+            input = fixed;
         }
-
-        // Extract last part of the URL (the repo name)
-        int lastSlash = name.lastIndexOf('/');
-        if (lastSlash > 0 && lastSlash < name.length() - 1) {
-            name = name.substring(lastSlash + 1);
-        }
-
-        return name;
+        return input;
     }
 
-    /**
-     * Clean up a cloned repository directory
-     *
-     * @param repoPath Path to the cloned repository
-     */
-    public void cleanupRepository(Path repoPath) {
-        if (repoPath != null) {
-            try {
-                // Recursively delete the directory
-                deleteDirectory(repoPath.toFile());
-                log.info("Cleaned up repository: {}", repoPath);
-            } catch (IOException e) {
-                log.warn("Warning: Failed to clean up repository at {}: {}", repoPath, e.getMessage());
+    private void ensureHttpOrSshUrl(String url) {
+        if (url.startsWith("http")) {
+            try { new URL(url); } catch (MalformedURLException e) {
+                throw new GitServiceException("Malformed repository URL: " + url, e);
             }
+        } else if (url.matches("^[^@\\s]+@[^:\\s]+:.*$")) {
+            // ssh style is fine
+        } else {
+            throw new GitServiceException("Unsupported repository URL scheme: " + url);
         }
     }
 
-    /**
-     * Recursively delete a directory
-     */
-    private void deleteDirectory(File directory) throws IOException {
-        if (directory.exists()) {
-            File[] files = directory.listFiles();
-            if (files != null) {
-                for (File file : files) {
-                    if (file.isDirectory()) {
-                        deleteDirectory(file);
-                    } else {
-                        if (!file.delete()) {
-                            throw new IOException("Failed to delete file: " + file);
-                        }
-                    }
-                }
-            }
-            if (!directory.delete()) {
-                throw new IOException("Failed to delete directory: " + directory);
-            }
-        }
-    }
-
-    /**
-     * Custom exception for Git service errors
-     */
-    public static class GitServiceException extends Exception {
-        public GitServiceException(String message) {
-            super(message);
-        }
-
-        public GitServiceException(String message, Throwable cause) {
-            super(message, cause);
-        }
+    public static class GitServiceException extends RuntimeException {
+        public GitServiceException(String msg) { super(msg); }
+        public GitServiceException(String msg, Throwable cause) { super(msg, cause); }
     }
 }

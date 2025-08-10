@@ -1,10 +1,9 @@
 package com.example.demo.service;
 
-
-
 import com.example.demo.kafka.FeedbackProducer;
 import com.example.demo.model.*;
 import com.example.demo.utils.*;
+import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -22,6 +21,7 @@ import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.Locale;
 
 /**
  * Service for evaluating repository code quality
@@ -31,31 +31,53 @@ import java.util.concurrent.*;
 public class RepositoryEvaluatorService {
 
     private final ProducerFactory producerFactory;
+
     @Value("${groq.api.key}")
     private String groqApiKey;
 
-    @Value("${evaluation.concurrency:5}")
+    // Lower this in properties to reduce burst parallelism when using on_demand tier
+    @Value("${evaluation.concurrency:2}")
     private int concurrencyLevel;
 
     @Value("${evaluation.timeout.seconds:600}")
     private int evaluationTimeoutSeconds;
 
-    private final DependencyAnalyzer dependencyAnalyzer;
-    private final GroqClient groqClient;
+    // App-level TPM limiter (tokens per minute) to avoid 429s
+    @Value("${groq.tpm.limit:6000}")
+    private long groqTpmLimit;
+
+    // Content caps to keep prompts small and within context/TPM budgets
+    private static final int SUMMARY_MAX_CHARS = 6000;   // ~2k tokens
+    private static final int EVAL_MAX_CHARS    = 12000;  // ~4k tokens
+    private static final long MAX_FILE_BYTES   = 200_000; // hard cap for files sent to LLM (200 KB)
+
+    private DependencyAnalyzer dependencyAnalyzer;
+    private GroqClient groqClient;
     private final GitUtils gitService;
-    private  final  FeedbackProducer feedbackProducer;
+    private final FeedbackProducer feedbackProducer;
     private static final Logger logger = LoggerFactory.getLogger(RepositoryEvaluatorService.class);
 
+    // Simple in-process token-bucket limiter for TPM
+    private final Object rlLock = new Object();
+    private double rlTokens;           // current tokens in bucket
+    private long rlLastRefillMs;       // last refill timestamp
 
     @Autowired
     public RepositoryEvaluatorService(GitUtils gitService, FeedbackProducer feedbackProducer, ProducerFactory producerFactory) {
+        this.gitService = gitService;
+        this.feedbackProducer = feedbackProducer;
+        this.producerFactory = producerFactory;
+    }
 
-        // Initialize components
+    @PostConstruct
+    void init() {
         this.dependencyAnalyzer = new DependencyCheckAnalyzer();
         this.groqClient = new GroqClient(groqApiKey);
-        this.gitService = gitService;
-        this.feedbackProducer= feedbackProducer;
-        this.producerFactory = producerFactory;
+        // init rate limiter
+        synchronized (rlLock) {
+            this.rlTokens = groqTpmLimit;
+            this.rlLastRefillMs = System.currentTimeMillis();
+        }
     }
 
     /**
@@ -63,9 +85,8 @@ public class RepositoryEvaluatorService {
      *
      * @param repoUrl URL of the GitHub repository
      * @param submissionId ID of the submission being evaluated
-     * @return Evaluation results
      */
-    public void  evaluateRepositoryFromUrl(String repoUrl, Long submissionId) {
+    public void evaluateRepositoryFromUrl(String repoUrl, Long submissionId) {
         Path repoPath = null;
 
         try {
@@ -79,11 +100,24 @@ public class RepositoryEvaluatorService {
             repoPath = gitService.cloneRepository(repoUrl);
             log.info("Repository cloned successfully to {}", repoPath);
 
+            // Sanity checks — these will reveal if cloneRepository returned a URL-like path
+            log.info("Clone returned path: {}", repoPath);
+            if (repoPath == null) {
+                throw new IllegalStateException("gitService.cloneRepository returned null");
+            }
+            String asString = repoPath.toString();
+            if (asString.startsWith("http://") || asString.startsWith("https://")
+                    || asString.matches("^[^@\\s]+@[^:\\s]+:.*$")) {
+                throw new IllegalStateException("Clone did not return a local directory. Got: " + asString);
+            }
+            if (!Files.exists(repoPath) || !Files.isDirectory(repoPath)) {
+                throw new IllegalStateException("Cloned path is not a directory on disk: " + repoPath.toAbsolutePath());
+            }
+
             // Evaluate the cloned repository
-             EvaluationResult evaluationResult=  evaluateRepository(repoPath, submissionId);
+            EvaluationResult evaluationResult = evaluateRepository(repoPath, submissionId);
             logger.info("Evaluation result: {}", evaluationResult);
             feedbackProducer.produceFeedback(evaluationResult);
-
 
         } catch (GitUtils.GitServiceException e) {
             log.error("Error cloning repository: {}", e.getMessage(), e);
@@ -105,7 +139,6 @@ public class RepositoryEvaluatorService {
      *
      * @param repoPath     Path to the repository
      * @param submissionId Unique identifier for this evaluation
-     * @return
      */
     public EvaluationResult evaluateRepository(Path repoPath, Long submissionId) {
         try {
@@ -137,9 +170,7 @@ public class RepositoryEvaluatorService {
             List<String> generalComments = generateOverallAssessment(context);
 
             // Create and return the evaluation result
-            return  new   EvaluationResult(submissionId, errors, improvements, thingsDoneRight, generalComments);
-
-
+            return new EvaluationResult(submissionId, errors, improvements, thingsDoneRight, generalComments);
 
         } catch (Exception e) {
             log.error("Error evaluating repository", e);
@@ -147,9 +178,7 @@ public class RepositoryEvaluatorService {
         }
     }
 
-    // Rest of the methods remain unchanged...
     private EvaluationContext buildContext(RepositoryTree repoTree, ToolResults dependencies) {
-        // Implementation remains the same
         EvaluationContext context = new EvaluationContext();
 
         // Process each file in the repository tree
@@ -164,8 +193,7 @@ public class RepositoryEvaluatorService {
     }
 
     private void processFileNode(FileNode node, RepositoryTree tree, EvaluationContext context) {
-        // Implementation remains the same
-        if (node.isFile() && shouldProcessFile(node)) {
+        if (node.isFile() && shouldProcessFile(node) && isLLMProcessable(node.getPath())) {
             try {
                 String content = Files.readString(Paths.get(node.getPath()));
                 String summary = generateFileSummary(node.getPath(), content);
@@ -184,12 +212,45 @@ public class RepositoryEvaluatorService {
             processFileNode(child, tree, context);
         }
     }
+
     /**
      * Determine if a file should be processed for evaluation
      */
     private boolean shouldProcessFile(FileNode node) {
-        // Skip very large files and binary files
+        // Keep your own heuristics (source/config/docs)
         return node.isSourceCode() || node.isConfigFile() || node.isDocumentation();
+    }
+
+    /**
+     * Additional gate to avoid sending noisy/huge files to the LLM
+     */
+    private boolean isLLMProcessable(String filePath) {
+        String lower = filePath.toLowerCase(Locale.ROOT);
+
+        // Exclude lock files and common noisy artifacts
+        if (lower.endsWith("package-lock.json")
+                || lower.endsWith("yarn.lock")
+                || lower.endsWith("pnpm-lock.yaml")
+                || lower.endsWith(".lock")
+                || lower.endsWith(".min.js")
+                || lower.endsWith(".map")
+                || lower.endsWith(".bundle.js")) {
+            return false;
+        }
+
+        // Exclude large files
+        try {
+            long size = Files.size(Paths.get(filePath));
+            if (size > MAX_FILE_BYTES) return false;
+        } catch (IOException ignored) {}
+
+        return true;
+    }
+
+    private String truncate(String s, int maxChars) {
+        if (s == null) return "";
+        if (s.length() <= maxChars) return s;
+        return s.substring(0, maxChars) + "\n... [truncated]";
     }
 
     /**
@@ -197,10 +258,15 @@ public class RepositoryEvaluatorService {
      */
     private String generateFileSummary(String filePath, String content) {
         try {
-            // Build prompt for file summary generation
+            String trimmed = truncate(content, SUMMARY_MAX_CHARS);
+
+            // Gate by TPM limiter before calling LLM
+            long estTokens = estimateTokens(200 + filePath.length() + trimmed.length());
+            acquireTokens(estTokens);
+
             String prompt = "Summarize what this " + FileUtil.getFileExtension(filePath) +
                     " file does in 1-2 sentences. Focus on purpose and key functionality. File: " +
-                    FileUtil.getFileName(filePath) + "\n\n" + content;
+                    FileUtil.getFileName(filePath) + "\n\n" + trimmed;
 
             String summary = groqClient.getCompletion(prompt);
 
@@ -237,14 +303,17 @@ public class RepositoryEvaluatorService {
                 if (processedFiles.contains(filePath)) continue;
 
                 FileNode fileNode = allFiles.get(filePath);
-                futureResults.put(filePath, submitFileEvaluation(fileNode, context, executor));
-                processedFiles.add(filePath);
+                if (fileNode != null && isLLMProcessable(fileNode.getPath())) {
+                    futureResults.put(filePath, submitFileEvaluation(fileNode, context, executor));
+                    processedFiles.add(filePath);
+                }
             }
 
             // Then process the rest of the files
             for (FileNode fileNode : allFiles.values()) {
                 String filePath = fileNode.getPath();
                 if (processedFiles.contains(filePath)) continue;
+                if (!isLLMProcessable(filePath)) continue;
 
                 futureResults.put(filePath, submitFileEvaluation(fileNode, context, executor));
                 processedFiles.add(filePath);
@@ -291,7 +360,7 @@ public class RepositoryEvaluatorService {
 
         // Also look for common entry point files
         for (String filePath : files.keySet()) {
-            String fileName = FileUtil.getFileName(filePath).toLowerCase();
+            String fileName = FileUtil.getFileName(filePath).toLowerCase(Locale.ROOT);
             if (fileName.contains("main") ||
                     fileName.contains("app") ||
                     fileName.contains("index") ||
@@ -316,7 +385,7 @@ public class RepositoryEvaluatorService {
      * Recursively collect source files
      */
     private void collectSourceFilesRecursive(FileNode node, Map<String, FileNode> files) {
-        if (node.isFile() && shouldProcessFile(node)) {
+        if (node.isFile() && shouldProcessFile(node) && isLLMProcessable(node.getPath())) {
             files.put(node.getPath(), node);
         } else if (!node.isFile()) {
             for (FileNode child : node.getChildren()) {
@@ -330,7 +399,6 @@ public class RepositoryEvaluatorService {
      */
     private Future<List<IssueItem>> submitFileEvaluation(
             FileNode fileNode, EvaluationContext context, ExecutorService executor) {
-
         return executor.submit(() -> evaluateFile(fileNode, context));
     }
 
@@ -348,12 +416,17 @@ public class RepositoryEvaluatorService {
                 content = Files.readString(Paths.get(filePath));
                 fileNode.setContent(content);
             }
+            String trimmed = truncate(content, EVAL_MAX_CHARS);
 
             // Get file context
             Map<String, Object> fileContext = context.getFileContext(filePath);
 
             // Build prompt for evaluation
-            String prompt = buildEvaluationPrompt(fileNode, content, fileContext);
+            String prompt = buildEvaluationPrompt(fileNode, trimmed, fileContext);
+
+            // Gate by TPM limiter before calling LLM (include prompt size; add margin for response)
+            long estTokens = estimateTokens(600 + prompt.length());
+            acquireTokens(estTokens);
 
             // Get evaluation from LLM
             String response = groqClient.getCompletion(prompt);
@@ -521,7 +594,7 @@ public class RepositoryEvaluatorService {
      */
     private List<String> generateOverallAssessment(EvaluationContext context) {
         try {
-            // Build prompt for overall assessment
+            // Build prompt for overall assessment (truncate list to reduce size)
             StringBuilder prompt = new StringBuilder();
             prompt.append("You are a code quality expert reviewing a repository. ")
                     .append("Based on the following information, provide an overall assessment ")
@@ -539,6 +612,10 @@ public class RepositoryEvaluatorService {
                 prompt.append("- ").append(entry.getKey())
                         .append(": ").append(entry.getValue()).append("\n");
             }
+
+            // Gate by TPM limiter
+            long estTokens = estimateTokens(500 + prompt.length());
+            acquireTokens(estTokens);
 
             // Get assessment
             String response = groqClient.getCompletion(prompt.toString());
@@ -587,5 +664,44 @@ public class RepositoryEvaluatorService {
      */
     private void addToMap(Map<String, List<IssueItem>> map, String filePath, IssueItem issue) {
         map.computeIfAbsent(filePath, k -> new ArrayList<>()).add(issue);
+    }
+
+    // -------- Rate limiter helpers (tokens per minute) --------
+
+    // crude char->token estimate to keep us safe
+    private long estimateTokens(int chars) {
+        return Math.max(1, chars / 4); // ~4 chars per token
+    }
+
+    private void acquireTokens(long needed) throws InterruptedException {
+        if (needed > groqTpmLimit) {
+            needed = groqTpmLimit; // cap a single request to bucket capacity
+        }
+        synchronized (rlLock) {
+            refillTokens();
+            while (rlTokens < needed) {
+                long sleepMs = computeSleepMillis(needed);
+                rlLock.wait(sleepMs);
+                refillTokens();
+            }
+            rlTokens -= needed;
+        }
+    }
+
+    private void refillTokens() {
+        long now = System.currentTimeMillis();
+        long elapsedMs = now - rlLastRefillMs;
+        if (elapsedMs <= 0) return;
+        double perMs = (double) groqTpmLimit / 60000.0; // tokens per ms
+        rlTokens = Math.min(groqTpmLimit, rlTokens + perMs * elapsedMs);
+        rlLastRefillMs = now;
+    }
+
+    private long computeSleepMillis(long needed) {
+        double deficit = needed - rlTokens;
+        if (deficit <= 0) return 0L;
+        double perMs = (double) groqTpmLimit / 60000.0;
+        long ms = (long) Math.ceil(deficit / perMs);
+        return Math.max(ms, 50L);
     }
 }
