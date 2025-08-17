@@ -1,0 +1,29 @@
+{
+  "errors" : [ {
+    "title" : "Hardcoded Sensitive Information (User Token)",
+    "filePath" : "backend/config.js",
+    "lineStart" : 1,
+    "lineEnd" : 1,
+    "severity" : "ERROR"
+  } ],
+  "improvements" : [ {
+    "title" : "Use Environment Variables for Sensitive Data",
+    "filePath" : "backend/config.js",
+    "lineStart" : 1,
+    "lineEnd" : 1,
+    "severity" : "WARNING"
+  }, {
+    "title" : "Clarify Variable Naming",
+    "filePath" : "backend/config.js",
+    "lineStart" : 1,
+    "lineEnd" : 1,
+    "severity" : "INFO"
+  } ],
+  "thingsDoneRight" : [ {
+    "title" : "Centralized Configuration",
+    "filePath" : "backend/config.js",
+    "lineStart" : 1,
+    "lineEnd" : 3,
+    "severity" : "INFO"
+  } ]
+}
