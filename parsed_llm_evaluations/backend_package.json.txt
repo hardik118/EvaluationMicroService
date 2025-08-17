@@ -1,0 +1,47 @@
+{
+  "errors" : [ {
+    "title" : "`nodemon` is missing from devDependencies",
+    "filePath" : "backend/package.json",
+    "lineStart" : 7,
+    "lineEnd" : 7,
+    "severity" : "ERROR"
+  } ],
+  "improvements" : [ {
+    "title" : "Empty 'description' field",
+    "filePath" : "backend/package.json",
+    "lineStart" : 4,
+    "lineEnd" : 4,
+    "severity" : "INFO"
+  }, {
+    "title" : "Empty 'keywords' field",
+    "filePath" : "backend/package.json",
+    "lineStart" : 10,
+    "lineEnd" : 10,
+    "severity" : "INFO"
+  }, {
+    "title" : "Empty 'author' field",
+    "filePath" : "backend/package.json",
+    "lineStart" : 11,
+    "lineEnd" : 11,
+    "severity" : "INFO"
+  }, {
+    "title" : "Consider adding a 'test' script",
+    "filePath" : "backend/package.json",
+    "lineStart" : 6,
+    "lineEnd" : 9,
+    "severity" : "INFO"
+  } ],
+  "thingsDoneRight" : [ {
+    "title" : "Clear separation of 'dev' and 'start' scripts",
+    "filePath" : "backend/package.json",
+    "lineStart" : 6,
+    "lineEnd" : 9,
+    "severity" : "INFO"
+  }, {
+    "title" : "Appropriate choice of backend dependencies",
+    "filePath" : "backend/package.json",
+    "lineStart" : 13,
+    "lineEnd" : 20,
+    "severity" : "INFO"
+  } ]
+}

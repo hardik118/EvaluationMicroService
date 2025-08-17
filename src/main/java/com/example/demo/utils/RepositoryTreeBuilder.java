@@ -1,6 +1,5 @@
 package com.example.demo.utils;
 
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -11,6 +10,10 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Builds an in-memory tree representation of a repository and can optionally
+ * fire node callbacks for each folder/file discovered.
+ */
 public class RepositoryTreeBuilder {
 
     private static final Logger log = LoggerFactory.getLogger(RepositoryTreeBuilder.class);
@@ -22,13 +25,23 @@ public class RepositoryTreeBuilder {
      * @return Tree representation of the repository
      */
     public static RepositoryTree buildTree(Path repoPath) {
+        return buildTree(repoPath, null);
+    }
+
+    /**
+     * Build a tree representation and notify the listener for each node.
+     *
+     * @param repoPath Path to the repository root
+     * @param listener NodeListener to receive folder/file events (may be null)
+     * @return Tree representation of the repository
+     */
+    public static RepositoryTree buildTree(Path repoPath, NodeListener listener) {
         try {
             // Validate input path
             if (repoPath == null) {
                 throw new IllegalArgumentException("repoPath is null");
             }
             String asString = repoPath.toString();
-            // Guard against passing remote URLs or SSH refs
             if (asString.startsWith("http://") || asString.startsWith("https://")
                     || asString.matches("^[^@\\s]+@[^:\\s]+:.*$")) {
                 throw new IllegalArgumentException(
@@ -42,80 +55,74 @@ public class RepositoryTreeBuilder {
                 throw new NotDirectoryException(asString);
             }
 
-            // Normalize to real path (without following symlinks for the root)
+            // Normalize root
             Path root = repoPath.toRealPath(LinkOption.NOFOLLOW_LINKS);
 
-            // Create root node for the repository
+            // Create root node
             FileNode rootNode = new FileNode("", false, null);
-
-            // Map to keep track of directory nodes
             Map<Path, FileNode> dirMap = new HashMap<>();
             dirMap.put(root, rootNode);
 
+            // If listener present, notify root
+            if (listener != null) {
+                listener.onFolder("", null);
+            }
+
             // Walk the file tree
-            Files.walkFileTree(
-                    root,
+            Files.walkFileTree(root,
                     EnumSet.of(FileVisitOption.FOLLOW_LINKS),
                     Integer.MAX_VALUE,
                     new SimpleFileVisitor<Path>() {
                         @Override
                         public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
-                            // Skip hidden directories and specific directories we want to ignore
                             if (shouldIgnoreDirectory(dir)) {
                                 return FileVisitResult.SKIP_SUBTREE;
                             }
-
-                            // Skip the root directory (already created)
                             if (dir.equals(root)) {
                                 return FileVisitResult.CONTINUE;
                             }
-
-                            // Get parent directory node
                             Path parentDir = dir.getParent();
                             FileNode parentNode = dirMap.get(parentDir);
-
                             if (parentNode == null) {
                                 log.warn("Parent node not found for directory: {}", dir);
                                 return FileVisitResult.CONTINUE;
                             }
-
-                            // Create node for this directory (keep as relative for readability)
-                            String relativePath = root.relativize(dir).toString();
+                            String relativePath = normalize(root.relativize(dir).toString());
                             FileNode dirNode = new FileNode(relativePath, false, parentNode);
-
-                            // Add to parent's children
                             parentNode.addChild(dirNode);
-
-                            // Add to directory map
                             dirMap.put(dir, dirNode);
 
+                            // Notify listener
+                            if (listener != null) {
+                                String parentRel = normalize(root.relativize(parentDir).toString());
+                                listener.onFolder(relativePath, parentRel.isEmpty() ? null : parentRel);
+                            }
                             return FileVisitResult.CONTINUE;
                         }
 
                         @Override
                         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) {
-                            // Skip hidden files and files we want to ignore
                             if (shouldIgnoreFile(file)) {
                                 return FileVisitResult.CONTINUE;
                             }
-
-                            // Get parent directory node
                             Path parentDir = file.getParent();
                             FileNode parentNode = dirMap.get(parentDir);
-
                             if (parentNode == null) {
                                 log.warn("Parent node not found for file: {}", file);
                                 return FileVisitResult.CONTINUE;
                             }
-
-                            // Store ABSOLUTE path for files so later Files.readString(...) works
-                            String relativePath = root.relativize(file).toString();
+                            String relativePath = normalize(root.relativize(file).toString());
                             String absolutePath = root.resolve(relativePath).toString();
                             FileNode fileNode = new FileNode(absolutePath, true, parentNode);
-
-                            // Add to parent's children
                             parentNode.addChild(fileNode);
 
+                            // Notify listener
+                            if (listener != null) {
+                                String parentRel = normalize(root.relativize(parentDir).toString());
+                                listener.onFile(relativePath,
+                                        parentRel.isEmpty() ? null : parentRel,
+                                        file);
+                            }
                             return FileVisitResult.CONTINUE;
                         }
 
@@ -124,9 +131,7 @@ public class RepositoryTreeBuilder {
                             log.warn("Failed to visit file: {}", file, exc);
                             return FileVisitResult.CONTINUE;
                         }
-                    }
-            );
-
+                    });
             return new RepositoryTree(rootNode);
 
         } catch (IOException e) {
@@ -135,56 +140,41 @@ public class RepositoryTreeBuilder {
         }
     }
 
-    /**
-     * Check if a directory should be ignored
-     */
-    private static boolean shouldIgnoreDirectory(Path dir) {
-        String dirName = dir.getFileName() != null ? dir.getFileName().toString() : "";
-
-        // Skip hidden directories
-        if (dirName.startsWith(".")) {
-            return true; // covers .git, .idea, .vscode, etc.
-        }
-
-        // Skip common directories to ignore
-        return dirName.equals("node_modules") ||
-                dirName.equals("target") ||
-                dirName.equals("build") ||
-                dirName.equals("dist") ||
-                dirName.equals("venv") ||
-                dirName.equals("__pycache__") ||
-                dirName.equals("bin") ||
-                dirName.equals("obj");
+    private static String normalize(String path) {
+        String p = path.replace('\\', '/');
+        if (p.startsWith("./")) p = p.substring(2);
+        return p;
     }
 
-    /**
-     * Check if a file should be ignored
-     */
+    private static boolean shouldIgnoreDirectory(Path dir) {
+        String dirName = dir.getFileName() != null ? dir.getFileName().toString() : "";
+        if (dirName.startsWith(".")) return true;
+        return dirName.equals("node_modules")
+                || dirName.equals("target")
+                || dirName.equals("build")
+                || dirName.equals("dist")
+                || dirName.equals("venv")
+                || dirName.equals("__pycache__")
+                || dirName.equals("bin")
+                || dirName.equals("obj");
+    }
+
     private static boolean shouldIgnoreFile(Path file) {
         String fileName = file.getFileName() != null ? file.getFileName().toString() : "";
-
-        // Skip hidden files
         if (fileName.startsWith(".")) {
             return true;
         }
-
-        // Skip very large files and non-text files, unless whitelisted
-        if (FileUtil.isFileTooLarge(file) ||
-                (!FileUtil.isTextFile(file) && !isImportantBinaryFile(fileName))) {
+        if (FileUtil.isFileTooLarge(file)
+                || (!FileUtil.isTextFile(file) && !isImportantBinaryFile(fileName))) {
             return true;
         }
-
         return false;
     }
 
-    /**
-     * Check if a non-text file is important (rare)
-     */
     private static boolean isImportantBinaryFile(String fileName) {
-        // These are actually text, but we keep this hook if you add real binary formats later.
-        return fileName.equals("pom.xml") ||
-                fileName.equals("build.gradle") ||
-                fileName.equals("package.json") ||
-                fileName.equals("package-lock.json");
+        return fileName.equals("pom.xml")
+                || fileName.equals("build.gradle")
+                || fileName.equals("package.json")
+                || fileName.equals("package-lock.json");
     }
 }

@@ -1,87 +1,162 @@
 package com.example.demo.utils;
 
 import lombok.Getter;
+import org.springframework.stereotype.Service;
+
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
 
 /**
- * Represents the file and directory structure of a repository
+ * Minimal RepositoryTree wrapper that exposes file-path helpers for building EvaluationContext
+ * without using the database.
+ *
+ * NOTE:
+ * - This is a simple data holder built by RepositoryTreeBuilder; it should NOT be a Spring bean.
+ * - Added getFileCount() and getDirectoryCount() to support logging in the service.
+
+ * Tree of repository contents.
  */
 public class RepositoryTree {
 
-    @Getter
     private final FileNode root;
-
-    @Getter
-    private int fileCount = 0;
-
-    @Getter
-    private int directoryCount = 0;
 
     public RepositoryTree(FileNode root) {
         this.root = root;
-        countNodes(root);
+    }
+
+    /** Expose the root node if callers need to traverse directly. */
+    public FileNode getRoot() {
+        return root;
     }
 
     /**
-     * Recursively count files and directories in the tree
+     * Count all files in the tree.
      */
-    private void countNodes(FileNode node) {
-        if (node.isFile()) {
-            fileCount++;
-        } else {
-            directoryCount++;
+    public int getFileCount() {
+        return countFiles(root);
+    }
+
+    /**
+     * Count all directories in the tree (excludes the root directory from the count).
+     */
+    public int getDirectoryCount() {
+        int total = countDirs(root);
+        // Exclude the artificial root node if it's a directory
+        return total > 0 ? total - 1 : 0;
+    }
+
+    private int countFiles(FileNode node) {
+        if (node == null) return 0;
+        int c = node.isFile() ? 1 : 0;
+        if (node.getChildren() != null) {
             for (FileNode child : node.getChildren()) {
-                countNodes(child);
+                c += countFiles(child);
+            }
+        }
+        return c;
+    }
+
+    private int countDirs(FileNode node) {
+        if (node == null) return 0;
+        int c = node.isFile() ? 0 : 1;
+        if (node.getChildren() != null) {
+            for (FileNode child : node.getChildren()) {
+                c += countDirs(child);
+            }
+        }
+        return c;
+    }
+
+    /**
+     * Get all files as absolute paths (as stored in FileNode for files).
+     */
+    public Collection<String> getAllFileAbsolutePaths() {
+        List<String> out = new ArrayList<>();
+        collectFiles(root, out, null);
+        return out;
+    }
+
+    /**
+     * Get all files as repo-relative paths by relativizing against repoRoot.
+     * If a node already contains a relative path, it will simply be normalized.
+     */
+    public Collection<String> getAllFilePaths(Path repoRoot) {
+        List<String> out = new ArrayList<>();
+        collectFiles(root, out, repoRoot);
+        return out;
+    }
+
+    private void collectFiles(FileNode node, List<String> out, Path repoRoot) {
+        if (node == null) return;
+
+        if (node.isFile()) {
+            String p = node.getPath(); // For files this may be absolute from your builder
+            if (p != null && !p.isBlank()) {
+                String normalized;
+                if (repoRoot != null) {
+                    try {
+                        Path rel = repoRoot.toAbsolutePath().normalize()
+                                .relativize(Paths.get(p).toAbsolutePath().normalize());
+                        normalized = rel.toString().replace('\\', '/');
+                    } catch (IllegalArgumentException ex) {
+                        // If relativize fails (different roots), fallback to normalization only
+                        normalized = p.replace('\\', '/');
+                    }
+                } else {
+                    normalized = p.replace('\\', '/');
+                }
+                out.add(normalized);
+            }
+        }
+
+        if (node.getChildren() != null) {
+            for (FileNode child : node.getChildren()) {
+                collectFiles(child, out, repoRoot);
             }
         }
     }
 
+    // ---------- NEW: Provide FileNode map keyed by repo-relative path ----------
+
     /**
-     * Find a node by its path
-     *
-     * @param path Path to search for
-     * @return The node if found, null otherwise
+     * Collect source files keyed by path. If repoRoot is provided, keys are repo-relative normalized paths
+     * (recommended, so they match EvaluationContext keys). Otherwise keys are normalized node.getPath().
      */
-    public FileNode findByPath(String path) {
-        return findByPath(root, path);
+    public Map<String, FileNode> collectSourceFiles(Path repoRoot) {
+        Map<String, FileNode> out = new LinkedHashMap<>();
+        collectSourceFilesRecursive(root, out, repoRoot);
+        return out;
     }
 
-    private FileNode findByPath(FileNode node, String path) {
-        if (node.getPath().equals(path)) {
-            return node;
-        }
+    /** Convenience overload: keys will be normalized absolute paths if builder stored absolute paths. */
+    public Map<String, FileNode> collectSourceFiles() {
+        return collectSourceFiles(null);
+    }
+
+    private void collectSourceFilesRecursive(FileNode node, Map<String, FileNode> out, Path repoRoot) {
+        if (node == null) return;
 
         if (node.isFile()) {
-            return null;
-        }
-
-        for (FileNode child : node.getChildren()) {
-            FileNode found = findByPath(child, path);
-            if (found != null) {
-                return found;
+            String p = node.getPath();
+            if (p != null && !p.isBlank()) {
+                String key;
+                if (repoRoot != null) {
+                    try {
+                        Path rel = repoRoot.toAbsolutePath().normalize()
+                                .relativize(Paths.get(p).toAbsolutePath().normalize());
+                        key = rel.toString().replace('\\', '/');
+                    } catch (IllegalArgumentException ex) {
+                        key = p.replace('\\', '/');
+                    }
+                } else {
+                    key = p.replace('\\', '/');
+                }
+                out.put(key, node);
             }
-        }
-
-        return null;
-    }
-
-    @Override
-    public String toString() {
-        StringBuilder sb = new StringBuilder();
-        sb.append("Repository Tree:\n");
-        appendNodeToString(root, sb, 0);
-        sb.append("\nTotal: ").append(fileCount).append(" files, ")
-                .append(directoryCount).append(" directories");
-        return sb.toString();
-    }
-
-    private void appendNodeToString(FileNode node, StringBuilder sb, int level) {
-        sb.append("  ".repeat(level));
-        sb.append(node.isFile() ? "📄 " : "📁 ");
-        sb.append(FileUtil.getFileName(node.getPath())).append("\n");
-
-        if (!node.isFile()) {
+        } else if (node.getChildren() != null) {
             for (FileNode child : node.getChildren()) {
-                appendNodeToString(child, sb, level + 1);
+                collectSourceFilesRecursive(child, out, repoRoot);
             }
         }
     }
