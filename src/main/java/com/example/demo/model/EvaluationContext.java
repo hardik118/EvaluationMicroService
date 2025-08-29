@@ -1,171 +1,277 @@
 package com.example.demo.model;
 
+import com.example.demo.DbModels.CodeFile;
+import com.example.demo.DbModels.Project;
+import com.example.demo.DbService.Impl.ProjectStorageService;
+import com.example.demo.utils.FileUtil;
 
+import java.nio.file.Path;
 import java.util.*;
 
 /**
- * Context information for repository evaluation
+ * DB-backed evaluation context.
+ * Builds context from CodeFile rows:
+ * - taking: resolved import paths (repo-relative)
+ * - calling: exported/public symbols
+ * - dependents: reverse index built from taking
+ * - language: detected/stored language for the file
+ *
+ * Backward compatibility:
+ * - getFileContext includes "dependencies" (alias to taking) and "dependents".
+ *
+ * NOTE: Summaries/folder presence are no longer populated here.
  */
 public class EvaluationContext {
-    // File information
-    private final Map<String, String> fileSummaries = new HashMap<>();
 
-    // Folder information
-    private final Map<String, List<String>> folderContents = new HashMap<>();
+    // Core maps (repo-relative normalized paths as keys)
+    private final Map<String, Set<String>> takingByFile = new HashMap<>();
+    private final Map<String, Set<String>> dependentsByFile = new HashMap<>();
+    private final Map<String, Set<String>> callingByFile = new HashMap<>();
+    private final Map<String, String> languageByFile = new HashMap<>();
 
-    // Dependencies between files
-    private final Map<String, Set<String>> fileDependencies = new HashMap<>();
+    // Convenience: all file paths tracked (repo-relative, normalized)
+    private final List<String> allFiles = new ArrayList<>();
 
     /**
-     * Add a summary of what a file does.
-     *
-     * @param filePath Path to the file
-     * @param summary Brief description of what the file does
+     * Build context directly from DB via ProjectStorageService, using the project's files.
+     * repoRoot is accepted for API clarity; paths stored in DB are repo-relative already.
      */
-    public void addFileSummary(String filePath, String summary) {
-        fileSummaries.put(filePath, summary);
+    public static EvaluationContext fromRepoPath(Path repoRoot, Project project, ProjectStorageService storage) {
+        Objects.requireNonNull(project, "project must not be null");
+        Objects.requireNonNull(storage, "storage must not be null");
 
-        // Also track this file in its parent folder
-        String folderPath = getParentPath(filePath);
-        folderContents.computeIfAbsent(folderPath, k -> new ArrayList<>()).add(filePath);
+        List<CodeFile> files = storage.listFiles(project);
+        EvaluationContext ctx = fromCodeFiles(files);
+
+
+        return ctx;
     }
 
     /**
-     * Add a dependency relationship between files.
-     *
-     * @param sourceFile File that depends on another
-     * @param targetFile File being depended on
+     * Build context from CodeFile rows for a project.
      */
-    public void addDependency(String sourceFile, String targetFile) {
-        fileDependencies.computeIfAbsent(sourceFile, k -> new HashSet<>()).add(targetFile);
-    }
+    public static EvaluationContext fromCodeFiles(Collection<CodeFile> files) {
+        EvaluationContext ctx = new EvaluationContext();
 
-    /**
-     * Get the summary of what a file does.
-     *
-     * @param filePath Path to the file
-     * @return Summary of the file's purpose or null if not available
-     */
-    public String getFileSummary(String filePath) {
-        return fileSummaries.get(filePath);
-    }
+        if (files != null) {
+            // Track paths without duplicates, preserving order
+            LinkedHashSet<String> seenPaths = new LinkedHashSet<>();
 
-    /**
-     * Get summaries of all files in a folder.
-     *
-     * @param folderPath Path to the folder
-     * @return Map of file paths to summaries for files in the folder
-     */
-    public Map<String, String> getFilesInFolder(String folderPath) {
-        Map<String, String> result = new HashMap<>();
+            // 1) Index primary maps
+            for (CodeFile cf : files) {
+                String path = normalizePath(cf.getPath());
+                if (path.isEmpty()) continue;
 
-        List<String> files = folderContents.getOrDefault(folderPath, Collections.emptyList());
-        for (String filePath : files) {
-            String summary = fileSummaries.get(filePath);
-            if (summary != null) {
-                result.put(filePath, summary);
+                seenPaths.add(path);
+
+                // taking (imports)
+                Collection<String> takingList = (cf.getTaking() != null) ? cf.getTaking() : Collections.emptySet();
+                Set<String> taking = new LinkedHashSet<>();
+                for (String t : takingList) {
+                    String nt = normalizePath(t);
+                    if (!nt.isEmpty()) taking.add(nt);
+                }
+                if (!taking.isEmpty()) {
+                    ctx.takingByFile.put(path, taking);
+                }
+
+                // calling (exports)
+                Collection<String> callingList = (cf.getCalling() != null) ? cf.getCalling() : Collections.emptySet();
+                Set<String> calling = new LinkedHashSet<>();
+                for (String c : callingList) {
+                    if (c != null && !c.isBlank()) calling.add(c.trim());
+                }
+                if (!calling.isEmpty()) {
+                    ctx.callingByFile.put(path, calling);
+                }
+
+                // language
+                if (cf.getLanguage() != null && !cf.getLanguage().isBlank()) {
+                    ctx.languageByFile.put(path, cf.getLanguage());
+                }
+            }
+
+            // finalize all files list in stable order
+            ctx.allFiles.addAll(seenPaths);
+
+            // 2) Build dependents (reverse index of taking)
+            for (Map.Entry<String, Set<String>> e : ctx.takingByFile.entrySet()) {
+                String src = e.getKey();
+                for (String tgt : e.getValue()) {
+                    ctx.dependentsByFile.computeIfAbsent(tgt, k -> new LinkedHashSet<>()).add(src);
+                }
             }
         }
 
-        return result;
+
+        return ctx;
     }
 
-    /**
-     * Get dependencies of a file.
-     *
-     * @param filePath Path to the file
-     * @return Set of files that this file depends on
-     */
-    public Set<String> getDependencies(String filePath) {
-        return fileDependencies.getOrDefault(filePath, Collections.emptySet());
-    }
+    // -------- Public accessors used by the evaluator --------
 
-    /**
-     * Get files that depend on a specific file.
-     *
-     * @param filePath Path to the file
-     * @return Set of files that depend on this file
-     */
-    public Set<String> getDependents(String filePath) {
-        Set<String> dependents = new HashSet<>();
-
-        for (Map.Entry<String, Set<String>> entry : fileDependencies.entrySet()) {
-            if (entry.getValue().contains(filePath)) {
-                dependents.add(entry.getKey());
-            }
-        }
-
-        return dependents;
-    }
-
-    /**
-     * Get related files (dependencies and dependents).
-     *
-     * @param filePath Path to the file
-     * @return Map of related files and their relationship type
-     */
-    public Map<String, String> getRelatedFiles(String filePath) {
-        Map<String, String> relatedFiles = new HashMap<>();
-
-        // Add dependencies
-        for (String dep : getDependencies(filePath)) {
-            relatedFiles.put(dep, "depends on");
-        }
-
-        // Add dependents
-        for (String dep : getDependents(filePath)) {
-            relatedFiles.put(dep, "used by");
-        }
-
-        return relatedFiles;
-    }
-
-    /**
-     * Get context information relevant for evaluating a file.
-     *
-     * @param filePath Path to the file being evaluated
-     * @return Map with contextual information
-     */
     public Map<String, Object> getFileContext(String filePath) {
-        Map<String, Object> context = new HashMap<>();
+        String np = normalizePath(filePath);
+        Map<String, Object> ctx = new HashMap<>();
 
-        // Add information about files in the same folder
-        String folderPath = getParentPath(filePath);
-        context.put("filesInSameFolder", getFilesInFolder(folderPath));
+        // Basic file identity
+        ctx.put("fileName", FileUtil.getFileName(np));
+        ctx.put("language", languageByFile.getOrDefault(np, null));
 
-        // Add information about dependencies and dependents
-        context.put("dependencies", getDependencies(filePath));
-        context.put("dependents", getDependents(filePath));
+        // Taking/Dependencies (alias for backward compatibility)
+        Set<String> taking = getTaking(np);
+        ctx.put("taking", taking);
+        ctx.put("dependencies", taking);
 
-        return context;
+        // Dependents (files that import this file)
+        Set<String> dependents = getDependents(np);
+        ctx.put("dependents", dependents);
+
+        // Calling (exported/public symbols)
+        Set<String> calling = getCalling(np);
+        ctx.put("calling", calling);
+
+        return ctx;
+    }
+
+    // Backward-compat convenience
+    public Set<String> getDependencies(String filePath) {
+        return getTaking(filePath);
+    }
+
+    public Set<String> getTaking(String filePath) {
+        return takingByFile.getOrDefault(normalizePath(filePath), Collections.emptySet());
+    }
+
+    public Set<String> getDependents(String filePath) {
+        return dependentsByFile.getOrDefault(normalizePath(filePath), Collections.emptySet());
+    }
+
+    public Set<String> getCalling(String filePath) {
+        return callingByFile.getOrDefault(normalizePath(filePath), Collections.emptySet());
+    }
+
+    public String getLanguage(String filePath) {
+        return languageByFile.get(normalizePath(filePath));
     }
 
     /**
-     * Extract the parent path from a file path.
+     * Helper: return all repo-relative file paths known to the context.
      */
-    private String getParentPath(String filePath) {
-        int lastSeparator = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
-        return (lastSeparator > 0) ? filePath.substring(0, lastSeparator) : "";
+    public List<String> getAllFilePaths() {
+        return Collections.unmodifiableList(allFiles);
     }
 
-    public void addComplexityMetric(String filePath, ComplexityMetric metric) {
+    // Kept for compatibility with earlier code that used this name.
+    public List<String> getAllTrackedFiles() {
+        return getAllFilePaths();
     }
 
-    /**
-     * Get all file summaries.
-     *
-     * @return Unmodifiable map of file paths to summaries
-     */
+    public int getApproximateFilePresenceCount() {
+        return allFiles.size();
+    }
+
+    // Summaries are not populated in this DB-backed context.
     public Map<String, String> getFileSummaries() {
-        return Collections.unmodifiableMap(fileSummaries);
+        return Map.of();
+    }
+
+    public int getFileCount() {
+        return 0;
+    }
+
+    // -------- Debug/printing helpers --------
+
+    @Override
+    public String toString() {
+        int edges = takingByFile.values().stream().mapToInt(Set::size).sum();
+        return "EvaluationContext{files=" + allFiles.size()
+                + ", edges=" + edges
+                + ", withLanguages=" + languageByFile.size()
+                + "}";
     }
 
     /**
-     * Get the total number of files with summaries.
-     *
-     * @return Count of files with summaries
+     * Human-readable, multi-line dump with limits.
      */
-    public int getFileCount() {
-        return fileSummaries.size();
+    public String toPrettyString(int maxRows) {
+        StringBuilder sb = new StringBuilder();
+        int edges = takingByFile.values().stream().mapToInt(Set::size).sum();
+        sb.append("EvaluationContext\n");
+        sb.append("- files: ").append(allFiles.size()).append('\n');
+        sb.append("- edges: ").append(edges).append('\n');
+        sb.append("- languages: ").append(languageByFile.size()).append('\n');
+
+        sb.append("\nFiles (first ").append(Math.min(maxRows, allFiles.size())).append("):\n");
+        for (int i = 0; i < Math.min(maxRows, allFiles.size()); i++) {
+            sb.append("  ").append(allFiles.get(i)).append('\n');
+        }
+
+        sb.append("\nTaking (first ").append(maxRows).append(" rows):\n");
+        appendMapSample(sb, takingByFile, maxRows);
+
+        sb.append("\nCalling (first ").append(maxRows).append(" rows):\n");
+        appendMapSample(sb, callingByFile, maxRows);
+
+        sb.append("\nDependents (first ").append(maxRows).append(" rows):\n");
+        appendMapSample(sb, dependentsByFile, maxRows);
+
+        return sb.toString();
+    }
+
+    /**
+     * Snapshot as plain Java types (good for JSON serialization).
+     */
+    public Map<String, Object> debugSnapshot() {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("files", new ArrayList<>(allFiles));
+        m.put("languageByFile", new LinkedHashMap<>(languageByFile));
+        m.put("takingByFile", copyMapOfSets(takingByFile));
+        m.put("callingByFile", copyMapOfSets(callingByFile));
+        m.put("dependentsByFile", copyMapOfSets(dependentsByFile));
+        return m;
+    }
+
+    private static Map<String, List<String>> copyMapOfSets(Map<String, Set<String>> src) {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        for (Map.Entry<String, Set<String>> e : src.entrySet()) {
+            out.put(e.getKey(), new ArrayList<>(e.getValue()));
+        }
+        return out;
+    }
+
+    private static void appendMapSample(StringBuilder sb, Map<String, ? extends Collection<String>> map, int maxRows) {
+        int i = 0;
+        for (Map.Entry<String, ? extends Collection<String>> e : map.entrySet()) {
+            if (i++ >= maxRows) break;
+            sb.append("  ").append(e.getKey()).append(" -> ").append(limitCollection(e.getValue(), 10)).append('\n');
+        }
+        if (map.isEmpty()) {
+            sb.append("  (empty)\n");
+        }
+    }
+
+    private static String limitCollection(Collection<?> c, int maxElems) {
+        if (c == null || c.isEmpty()) return "[]";
+        StringBuilder sb = new StringBuilder("[");
+        int i = 0;
+        for (Object o : c) {
+            if (i++ > 0) sb.append(", ");
+            if (i > maxElems) {
+                sb.append("... (").append(c.size() - (i - 1)).append(" more)");
+                break;
+            }
+            sb.append(Objects.toString(o));
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    // -------- Helpers --------
+    private static String normalizePath(String p) {
+        if (p == null) return "";
+        String n = p.replace('\\', '/').trim();
+        if (n.startsWith("./")) n = n.substring(2);
+        if (n.startsWith("/")) n = n.substring(1);
+        return n;
     }
 }
