@@ -1,5 +1,6 @@
 package com.example.demo.DbRepository;
 
+import com.example.demo.DbModels.CodeFile;
 import com.example.demo.DbModels.Folder;
 import com.example.demo.DbModels.Project;
 import org.springframework.data.jpa.repository.JpaRepository;
@@ -11,4 +12,5 @@ public interface FolderRepository extends JpaRepository<Folder, Long> {
     List<Folder> findByProject(Project project);
     Optional<Folder> findByProjectAndPath(Project project, String path); // path="" for root
     boolean existsByProjectAndPath(Project project, String path);
+    List<Folder> findAllFoldersByProjectId(Long projectId);
 }

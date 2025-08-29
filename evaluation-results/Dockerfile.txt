@@ -1,3 +1,0 @@
-Evaluation results for file: Dockerfile
-
-No issues found.

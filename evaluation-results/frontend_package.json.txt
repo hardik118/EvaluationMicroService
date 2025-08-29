@@ -1,3 +1,0 @@
-Evaluation results for file: frontend/package.json
-
-No issues found.

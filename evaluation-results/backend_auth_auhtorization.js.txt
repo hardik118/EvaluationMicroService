@@ -1,3 +1,0 @@
-Evaluation results for file: backend/auth/auhtorization.js
-
-No issues found.

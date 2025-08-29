@@ -1,3 +1,0 @@
-Evaluation results for file: backend/index.js
-
-No issues found.

@@ -1,18 +1,17 @@
 package com.example.demo.DbService.Impl;
 
 import com.example.demo.DbModels.CodeFile;
+import com.example.demo.DbModels.Dto.FileSummaryProjection;
 import com.example.demo.DbModels.Folder;
 import com.example.demo.DbModels.Project;
 import com.example.demo.DbRepository.CodeFileRepository;
 import com.example.demo.DbRepository.FolderRepository;
+import com.example.demo.DbRepository.ProjectRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.util.Collection;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.function.Consumer;
 
 @Service
@@ -21,6 +20,7 @@ public class ProjectStorageService {
 
     private final FolderRepository folderRepository;
     private final CodeFileRepository codeFileRepository;
+    private final ProjectRepository projectRepository;
 
     /* ---------- Public API ---------- */
 
@@ -105,9 +105,71 @@ public class ProjectStorageService {
         return upsertFile(project, filePath, file -> file.setContextJson(contextJson));
     }
 
+    @Transactional
+    public boolean addSummaryToProjectFiles(Long projectId, String repoRelPath, String summary) {
+        Optional<Project> projectOpt = projectRepository.findBySubmissionId(projectId);
+        if (projectOpt.isEmpty()) {
+            return false;  // Project not found
+        }
+
+        Project project = projectOpt.get();
+
+        Optional<CodeFile> fileOpt = codeFileRepository.findByProjectAndPath(project, repoRelPath);
+        if (fileOpt.isEmpty()) {
+            return false;  // File not found
+        }
+
+        setFileContext(project, repoRelPath, summary);
+        return true;
+    }
+
+    public List<Folder> findAllFoldersByProjectId(Long projectId){
+        List<Folder> folders =  folderRepository.findAllFoldersByProjectId(projectId);
+        if(folders.isEmpty()){
+            return Collections.emptyList();
+        }
+        return folders;
+
+
+    }
+
+
+
+    @Transactional(readOnly = true)
+    public Map<String, String> getAllFileSummariesBySubmissionId(Long submissionId) {
+        Project project = projectRepository.findBySubmissionId(submissionId)
+                .orElseThrow(() -> new IllegalArgumentException("Project not found"));
+
+        List<FileSummaryProjection> summaries = codeFileRepository.findSummariesByProject(project);
+
+        Map<String, String> summaryMap = new LinkedHashMap<>();
+        for (FileSummaryProjection summary : summaries) {
+            String content = summary.getContextJson();
+            if (content != null && !content.isBlank()) {
+                summaryMap.put(summary.getPath(), content);
+            }
+        }
+
+        return summaryMap;
+    }
+
+
+
+
     @Transactional(readOnly = true)
     public List<CodeFile> listFiles(Project project) {
         return codeFileRepository.findAllByProjectWithTakingAndCallingFetched(project);
+    }
+
+    public List<String > findAllFilespathsByFolderId(Long  folderId) {
+        List<String> allPaths= codeFileRepository.findFilePathsByFolderId(folderId);
+        if(allPaths.isEmpty()){
+            return Collections.emptyList();
+        }
+
+        return allPaths;
+
+
     }
 
     /* ---------- Deduped helpers ---------- */

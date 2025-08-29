@@ -23,6 +23,8 @@ public class FeedbackProducer {
             kafkaTemplate.send(TOPIC, key, evaluationResult);
             logger.info("Sent evaluation feedback for submission {}", evaluationResult.getSubmissionId());
             return true;
+
+
         } catch (Exception e) {
             logger.error("Failed to send evaluation feedback to Kafka: {}", e.getMessage(), e);
             return false;

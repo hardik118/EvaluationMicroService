@@ -1,3 +1,0 @@
-Evaluation results for file: frontend/src/index.css
-
-No issues found.

@@ -8,7 +8,6 @@ import com.example.demo.model.EvaluationContext;
 import com.example.demo.model.EvaluationResult;
 import com.example.demo.model.IssueItem;
 import com.example.demo.utils.*;
-import jakarta.annotation.PostConstruct;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -17,7 +16,6 @@ import org.springframework.stereotype.Service;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -32,7 +30,6 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class RepositoryEvaluatorService {
 
-    private final ProducerFactory<?, ?> producerFactory;
     private final DependencyCheckAnalyzer dependencyCheckAnalyzer;
     private final GitUtils gitService;
     private final FeedbackProducer feedbackProducer;
@@ -44,6 +41,9 @@ public class RepositoryEvaluatorService {
     // Delegate file-level evaluations to a dedicated service
     @Autowired
     private     EvaluationService evaluationService;
+
+    @Autowired
+    private   SummaryService summaryService;
 
 
 
@@ -57,9 +57,7 @@ public class RepositoryEvaluatorService {
     private final Object rlLock = new Object();
     private double rlTokens;
     private long rlLastRefillMs;
-
-    @Autowired
-    private ProjectStorageService projectStorageService;
+    private final ProjectStorageService projectStorageService;
 
     public RepositoryEvaluatorService(
             GitUtils gitService,
@@ -67,14 +65,14 @@ public class RepositoryEvaluatorService {
             ProducerFactory<?, ?> producerFactory,
             DependencyCheckAnalyzer dependencyCheckAnalyzer,
             ProjectService projectService,
-            GroqClient groqClient
+            GroqClient groqClient,ProjectStorageService  projectStorageService
     ) {
         this.gitService = gitService;
         this.feedbackProducer = feedbackProducer;
-        this.producerFactory = producerFactory;
         this.dependencyCheckAnalyzer = dependencyCheckAnalyzer;
         this.projectService = projectService;
         this.groqClient = groqClient;
+        this.projectStorageService = projectStorageService;
     }
 
 
@@ -82,7 +80,7 @@ public class RepositoryEvaluatorService {
     /**
      * Evaluate a repository from its GitHub URL
      */
-    public void evaluateRepositoryFromUrl(String repoUrl, Long submissionId) {
+    public void evaluateRepositoryFromUrl(String repoUrl, Long submissionId, String UserIntent) {
         Path repoPath = null;
 
         try {
@@ -101,7 +99,7 @@ public class RepositoryEvaluatorService {
                 throw new IllegalStateException("Cloned path is not a directory on disk: " + repoPath.toAbsolutePath());
             }
 
-            EvaluationResult evaluationResult = evaluateRepository(repoPath, submissionId);
+            EvaluationResult evaluationResult = evaluateRepository(repoPath, submissionId,  UserIntent);
             log.info("Evaluation result ready for submissionId={}", submissionId);
             feedbackProducer.produceFeedback(evaluationResult);
 
@@ -122,12 +120,9 @@ public class RepositoryEvaluatorService {
     /**
      * Evaluate the code quality of a repository
      */
-    public EvaluationResult evaluateRepository(Path repoPath, Long submissionId) {
+    public EvaluationResult evaluateRepository(Path repoPath, Long submissionId, String UserIntent) {
         try {
-            ProgressLog.write("evaluation.start", Map.of(
-                    "submissionId", submissionId,
-                    "repoPath", String.valueOf(repoPath))
-            );
+
             log.info("Starting evaluation of repository at {}", repoPath);
 
             Optional<Project> newProject = projectService.findBySubmissionId(submissionId);
@@ -149,21 +144,10 @@ public class RepositoryEvaluatorService {
             // Build evaluation context from DB
             EvaluationContext context = EvaluationContext.fromRepoPath(repoPath, project, projectStorageService);
             log.info("\n{}", context.toPrettyString(25));
-            ProgressLog.write("evaluation.context", context.debugSnapshot());
 
             // Submit files for evaluation via EvaluationService (returns futures)
-            Map<String, Future<List<IssueItem>>> futureResults =
-                    evaluationService.submitFilesForEvaluation(repoTree, context,repoPath);
-
-
-// Define output folder to store result files
-            Path evaluationOutputDir = Paths.get("evaluation-results");
-
-// Timeout seconds, e.g. 60 seconds
-            int evaluationTimeoutSeconds = 60;
-
-// Save the results in separate .txt files inside evaluation-results folder
-            evaluationService.saveEvaluationResultsToFiles(futureResults, evaluationOutputDir, evaluationTimeoutSeconds);
+            Map<String, Future<Map<String, List<IssueItem>>>> futureResults =
+                    evaluationService.submitFilesForEvaluation(repoTree, context, repoPath,submissionId);
 
 
             // Aggregate results
@@ -175,28 +159,14 @@ public class RepositoryEvaluatorService {
             processEvaluationResults(futureResults, errors, improvements, thingsDoneRight);
 
             // Generate overall assessment (optional higher-level summary)
-            List<String> generalComments = generateOverallAssessment(context);
+            List<String> generalComments = generateOverallAssessment(submissionId, UserIntent , repoTree);
 
             // Final structured result
-            EvaluationResult result = new EvaluationResult(submissionId, errors, improvements, thingsDoneRight, generalComments);
-
-            // Log summary to process log
-            Map<String, Object> summary = new LinkedHashMap<>();
-            summary.put("submissionId", submissionId);
-            summary.put("filesEvaluated", futureResults.size());
-            summary.put("errorsCount", errors.values().stream().mapToInt(List::size).sum());
-            summary.put("improvementsCount", improvements.values().stream().mapToInt(List::size).sum());
-            summary.put("thingsDoneRightCount", thingsDoneRight.values().stream().mapToInt(List::size).sum());
-            ProgressLog.write("evaluation.summary", summary);
-
-            return result;
+            return new EvaluationResult(submissionId, errors, improvements, thingsDoneRight, generalComments);
 
         } catch (Exception e) {
             log.error("Error evaluating repository", e);
-            ProgressLog.write("evaluation.error", Map.of(
-                    "submissionId", submissionId,
-                    "error", String.valueOf(e))
-            );
+
             throw new RuntimeException("Failed to evaluate repository", e);
         }
     }
@@ -205,33 +175,42 @@ public class RepositoryEvaluatorService {
      * Wait for futures, bucket issues, and log per-file results to process.log
      */
     private void processEvaluationResults(
-            Map<String, Future<List<IssueItem>>> futureResults,
+            Map<String, Future<Map<String, List<IssueItem>>>> futureResults,
             Map<String, List<IssueItem>> errors,
             Map<String, List<IssueItem>> improvements,
             Map<String, List<IssueItem>> thingsDoneRight) {
 
-        for (Map.Entry<String, Future<List<IssueItem>>> entry : futureResults.entrySet()) {
+        for (Map.Entry<String, Future<Map<String, List<IssueItem>>>> entry : futureResults.entrySet()) {
             String filePath = entry.getKey();
-            Future<List<IssueItem>> future = entry.getValue();
+            Future<Map<String, List<IssueItem>>> future = entry.getValue();
 
             try {
-                List<IssueItem> issues = future.get(evaluationTimeoutSeconds, TimeUnit.SECONDS);
+                Map<String, List<IssueItem>> groupedIssues = future.get(evaluationTimeoutSeconds, TimeUnit.SECONDS);
 
-                // Log to process.log per file
+                // Log summary for the file
+                int totalIssues = groupedIssues.values().stream()
+                        .mapToInt(List::size)
+                        .sum();
+
                 Map<String, Object> fileLog = new LinkedHashMap<>();
                 fileLog.put("file", filePath);
-                fileLog.put("issueCount", issues.size());
-                fileLog.put("issues", issues); // ensure IssueItem has a readable toString or is serializable
-                ProgressLog.write("evaluation.file", fileLog);
+                fileLog.put("issueCount", totalIssues);
+                fileLog.put("issues", groupedIssues); // grouped map now
 
-                // Bucket issues
-                for (IssueItem issue : issues) {
-                    if (issue.getSeverity() == IssueItem.IssueSeverity.ERROR) {
+                // Add to global buckets
+                if (groupedIssues.containsKey("errors")) {
+                    for (IssueItem issue : groupedIssues.get("errors")) {
                         addToMap(errors, issue.getFilePath(), issue);
-                    } else if (isPositiveSignal(issue.getDescription())) {
-                        addToMap(thingsDoneRight, issue.getFilePath(), issue);
-                    } else {
+                    }
+                }
+                if (groupedIssues.containsKey("improvements")) {
+                    for (IssueItem issue : groupedIssues.get("improvements")) {
                         addToMap(improvements, issue.getFilePath(), issue);
+                    }
+                }
+                if (groupedIssues.containsKey("thingsDoneRight")) {
+                    for (IssueItem issue : groupedIssues.get("thingsDoneRight")) {
+                        addToMap(thingsDoneRight, issue.getFilePath(), issue);
                     }
                 }
 
@@ -240,91 +219,90 @@ public class RepositoryEvaluatorService {
                 IssueItem errorItem = new IssueItem(
                         "Evaluation failed: " + e.getMessage(),
                         filePath,
-                        null,
+                        0,
+                        0,
                         null,
                         IssueItem.IssueSeverity.ERROR
                 );
                 addToMap(errors, filePath, errorItem);
-                ProgressLog.write("evaluation.file.error", Map.of(
-                        "file", filePath,
-                        "error", String.valueOf(e))
-                );
+
             }
         }
     }
 
-    private boolean isPositiveSignal(String description) {
-        if (description == null) return false;
-        String d = description.toLowerCase(Locale.ROOT);
-        return d.contains("good") || d.contains("right") || d.contains("well") || d.contains("best practice");
-    }
 
-    private List<String> generateOverallAssessment(EvaluationContext context) {
+
+
+    private List<String> generateOverallAssessment(Long submissionId, String userIntent, RepositoryTree repoTree) {
         try {
-            StringBuilder userPrompt = new StringBuilder();
-            userPrompt.append("Based on the following information, provide an overall assessment ")
-                    .append("of the codebase with key strengths and areas for improvement.\n\n");
-
-            userPrompt.append("Files (first 30 shown):\n");
-            int max = Math.min(30, context.getAllFilePaths().size());
-            for (int i = 0; i < max; i++) {
-                userPrompt.append("- ").append(context.getAllFilePaths().get(i)).append('\n');
+            // Step 1: Crawl and save repo summary
+            boolean success = summaryService.crawlAndSummarize(submissionId);
+            if (!success) {
+                throw new IllegalStateException("Failed to generate and save repo summary");
             }
 
-            // Define your system prompt
+            // Step 2: Fetch the saved repo summary
+            String repoSummary = projectService.getRepoSummary(submissionId)
+                    .orElseThrow(() -> new IllegalStateException("No repo summary found for submissionId: " + submissionId));
+
+            // Step 3: Construct prompts
             String systemPrompt = """
-            You are a code quality expert. Provide a concise and structured response:
-            - Start with **Strengths:** listing key positive points.
-            - Follow with **Areas for Improvement:** listing key issues.
-            - Use numbered lists for readability.
-            - Avoid additional commentary outside these sections.
-            """;
+        You are a software evaluator. The user describes an intent or goal, and you assess whether the codebase meets that goal.
+        Return your evaluation in two parts:
 
-            long estTokens = estimateTokens(systemPrompt.length() + userPrompt.length());
-            acquireTokens(estTokens);
+        1. A single summary sentence that clearly says "Yes, ..." or "No, ..." explaining whether the repo matches the user's intent.
+        2. A list of general comments evaluating the codebase, starting with phrases like:
+           - "Yes, the repo does this but..."
+           - "There are some issues with..."
+           - "The implementation could be improved by..."
 
-            // Call groqClient with both prompts
-            String response = groqClient.getCompletion(systemPrompt, userPrompt.toString(), 1024, 0.2);
+        Format:
+        ---
+        [Summary]
+        - Comment 1
+        - Comment 2
+        ...
+        ---
+        """;
 
-            String[] lines = response.split("\n");
+            String userPrompt = "User Intent: " + userIntent + "\n\nRepository Summary:\n" + repoSummary;
+
+            // Step 4: Get response from GroqClient
+            String response = groqClient.getCompletion(systemPrompt, userPrompt, 1024, 0.3);
+
+            // Step 5: Parse the response
             List<String> comments = new ArrayList<>();
+            String[] lines = response.split("\n");
+            boolean inCommentBlock = false;
 
-            StringBuilder currentComment = new StringBuilder();
             for (String line : lines) {
                 line = line.trim();
-                if (line.isEmpty()) {
-                    if (currentComment.length() > 0) {
-                        comments.add(currentComment.toString().trim());
-                        currentComment = new StringBuilder();
-                    }
-                } else if (line.startsWith("-") || line.startsWith("•")) {
-                    if (currentComment.length() > 0) {
-                        comments.add(currentComment.toString().trim());
-                    }
-                    currentComment = new StringBuilder(line.substring(1).trim());
-                } else {
-                    if (currentComment.length() > 0) {
-                        currentComment.append(" ");
-                    }
-                    currentComment.append(line);
+                if (line.isEmpty()) continue;
+                if (line.startsWith("---")) {
+                    inCommentBlock = !inCommentBlock;
+                    continue;
+                }
+
+                if (!inCommentBlock && comments.isEmpty()) {
+                    // First line outside comment block = summary sentence
+                    comments.add(line);
+                } else if (line.startsWith("-")) {
+                    comments.add(line.substring(1).trim());
                 }
             }
 
-            if (currentComment.length() > 0) {
-                comments.add(currentComment.toString().trim());
+            if (comments.isEmpty()) {
+                comments.add("No evaluation could be generated.");
             }
 
-            ProgressLog.write("evaluation.overall", Map.of("comments", comments));
             return comments;
 
         } catch (Exception e) {
             log.error("Failed to generate overall assessment", e);
-            List<String> fallback = new ArrayList<>();
-            fallback.add("Failed to generate overall assessment: " + e.getMessage());
-            ProgressLog.write("evaluation.overall.error", Map.of("error", String.valueOf(e)));
-            return fallback;
+            return List.of("Failed to generate overall assessment: " + e.getMessage());
         }
     }
+
 
 
     private void addToMap(Map<String, List<IssueItem>> map, String filePath, IssueItem issue) {

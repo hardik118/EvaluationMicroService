@@ -1,3 +1,0 @@
-Evaluation results for file: frontend/src/App.jsx
-
-No issues found.

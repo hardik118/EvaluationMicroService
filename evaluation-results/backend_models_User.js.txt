@@ -1,3 +1,0 @@
-Evaluation results for file: backend/models/User.js
-
-No issues found.

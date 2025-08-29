@@ -1,3 +1,0 @@
-Evaluation results for file: backend/routes/user.js
-
-No issues found.

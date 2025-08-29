@@ -1,3 +1,0 @@
-Evaluation results for file: frontend/index.html
-
-No issues found.

@@ -1,3 +1,0 @@
-Evaluation results for file: backend/routes/Account.js
-
-No issues found.

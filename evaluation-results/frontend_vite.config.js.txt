@@ -1,3 +1,0 @@
-Evaluation results for file: frontend/vite.config.js
-
-No issues found.
