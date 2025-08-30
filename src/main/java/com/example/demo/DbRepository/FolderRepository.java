@@ -11,4 +11,6 @@ public interface FolderRepository extends JpaRepository<Folder, Long> {
     List<Folder> findByProject(Project project);
     Optional<Folder> findByProjectAndPath(Project project, String path); // path="" for root
     boolean existsByProjectAndPath(Project project, String path);
+    List<Folder> findAllFoldersByProjectId(Long projectId);
+
 }

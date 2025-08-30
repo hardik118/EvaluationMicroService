@@ -67,6 +67,32 @@ public final class LlmPromptBuilder {
 
         return sb.toString();
     }
+    public static String buildSummaryPrompt(String filePath,
+                                            String language,
+                                            String content,
+                                            Map<String, Object> fileContext) {
+
+        StringBuilder sb = new StringBuilder(2048);
+
+        sb.append("You are a senior developer assistant. Provide a concise paragraph summary about the following code file:\n")
+                .append("- What the code does\n")
+                .append("- Its main objective or purpose\n")
+                .append("- Key libraries or components it uses\n\n");
+
+        sb.append("Repository context for this file:\n")
+                .append("- filePath: ").append(filePath).append('\n')
+                .append("- language: ").append(nullToNA(language)).append('\n');
+
+        sb.append("\nFile content starts:\n")
+                .append("```").append(languageTag(language)).append('\n')
+                .append(content).append('\n')
+                .append("```\n");
+
+        sb.append("\nPlease respond with only a single paragraph summary in plain text, no JSON or extra commentary.\n");
+
+        return sb.toString();
+    }
+
 
     private static String nullToNA(String s) {
         return (s == null || s.isBlank()) ? "n/a" : s;

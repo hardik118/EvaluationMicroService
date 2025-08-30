@@ -8,6 +8,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
+import static org.aspectj.weaver.tools.cache.SimpleCacheFactory.path;
+
 /**
  * Utility class for file operations
  */
@@ -139,6 +141,8 @@ public class FileUtil {
             return true; // If we can't determine size, assume it's too large
         }
     }
+
+
 
     /**
      * Read a file's content as a string

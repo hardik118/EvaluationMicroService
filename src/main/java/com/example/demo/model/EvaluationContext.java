@@ -4,7 +4,7 @@ import com.example.demo.DbModels.CodeFile;
 import com.example.demo.DbModels.Project;
 import com.example.demo.DbService.Impl.ProjectStorageService;
 import com.example.demo.utils.FileUtil;
-import com.example.demo.utils.ProgressLog;
+
 
 import java.nio.file.Path;
 import java.util.*;
@@ -44,11 +44,7 @@ public class EvaluationContext {
         List<CodeFile> files = storage.listFiles(project);
         EvaluationContext ctx = fromCodeFiles(files);
 
-        ProgressLog.write("evaluationContext.fromRepoPath", Map.of(
-                "repoRoot", String.valueOf(repoRoot),
-                "files", ctx.getApproximateFilePresenceCount(),
-                "edges", ctx.takingByFile.values().stream().mapToInt(Set::size).sum()
-        ));
+
         return ctx;
     }
 
@@ -57,6 +53,7 @@ public class EvaluationContext {
      */
     public static EvaluationContext fromCodeFiles(Collection<CodeFile> files) {
         EvaluationContext ctx = new EvaluationContext();
+
 
         if (files != null) {
             // Track paths without duplicates, preserving order
@@ -108,10 +105,7 @@ public class EvaluationContext {
             }
         }
 
-        ProgressLog.write("evaluationContext.fromDb", Map.of(
-                "files", ctx.getApproximateFilePresenceCount(),
-                "edges", ctx.takingByFile.values().stream().mapToInt(Set::size).sum()
-        ));
+
         return ctx;
     }
 
@@ -189,6 +183,7 @@ public class EvaluationContext {
 
     // -------- Debug/printing helpers --------
 
+
     @Override
     public String toString() {
         int edges = takingByFile.values().stream().mapToInt(Set::size).sum();
@@ -219,6 +214,7 @@ public class EvaluationContext {
 
         sb.append("\nCalling (first ").append(maxRows).append(" rows):\n");
         appendMapSample(sb, callingByFile, maxRows);
+
 
         sb.append("\nDependents (first ").append(maxRows).append(" rows):\n");
         appendMapSample(sb, dependentsByFile, maxRows);

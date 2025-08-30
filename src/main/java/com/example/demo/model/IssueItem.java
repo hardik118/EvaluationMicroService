@@ -42,19 +42,23 @@ public class IssueItem {
          */
         ERROR
     }
-    private String description;
+    private String title;
     private String filePath;
-    private Integer lineNumber;
-    private String codeContext;
-    private IssueSeverity severity = IssueSeverity.MEDIUM;
+    private Integer lineStart;
+    private Integer lineEnd;
+    private IssueSeverity severity;
+    private String codeSnippet;
 
     /**
      * Constructor with default severity (MEDIUM)
      */
-    public IssueItem(String description, String filePath, Integer lineNumber, String codeContext) {
-        this.description = description;
+    public IssueItem(String title, String filePath, Integer lineStart, Integer lineEnd, String codeSnippet, IssueSeverity severity) {
+        this.title = title;
         this.filePath = filePath;
-        this.lineNumber = lineNumber;
-        this.codeContext = codeContext;
+        this.lineStart = lineStart;
+        this.lineEnd = lineEnd;
+        this.codeSnippet = codeSnippet;
+        this.severity = severity;
     }
+
 }

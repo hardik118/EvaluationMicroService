@@ -1,11 +1,9 @@
 package com.example.demo.utils;
 
+import com.example.demo.DbService.Impl.ProjectStorageService;
 import com.example.demo.model.EvaluationContext;
 import com.example.demo.model.IssueItem;
-import com.example.demo.utils.FileNode;
-import com.example.demo.utils.GroqClient;
-import com.example.demo.utils.LlmPromptBuilder;
-import com.example.demo.utils.RepositoryTree;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -33,22 +31,24 @@ public class EvaluationService {
     private final int evaluationTimeoutSeconds = 600;
     private final int EVAL_MAX_CHARS = 32_000;
     private static final ObjectMapper mapper = new ObjectMapper();
+    private final ProjectStorageService projectStorageService;
 
 
-    public Map<String, Future<List<IssueItem>>> submitFilesForEvaluation(
-            RepositoryTree repoTree, EvaluationContext context, Path repoRoot) {
+    public Map<String, Future<Map<String, List<IssueItem>>>> submitFilesForEvaluation(
+            RepositoryTree repoTree, EvaluationContext context, Path repoRoot, Long submissionId) {
 
-        Map<String, Future<List<IssueItem>>> futureResults = new LinkedHashMap<>();
+        Map<String, Future<Map<String, List<IssueItem>>>> futureResults = new LinkedHashMap<>();
         ExecutorService executor = Executors.newFixedThreadPool(concurrencyLevel);
 
         try {
-            // IMPORTANT: repo-relative keys so they match EvaluationContext
             Map<String, FileNode> allFiles = repoTree.collectSourceFiles(repoRoot);
 
             for (Map.Entry<String, FileNode> e : allFiles.entrySet()) {
-                String repoRelPath = toRepoRelKey(e.getKey()); // no stripping of leading slash; keep as repo-relative
+                String repoRelPath = toRepoRelKey(e.getKey());
                 FileNode node = e.getValue();
-                futureResults.put(repoRelPath, submitFileEvaluation(repoRelPath, node, context, executor, repoRoot));
+                // Submit the evaluation task returning Map<String, List<IssueItem>> per file
+                futureResults.put(repoRelPath, submitFileEvaluation(repoRelPath, node, context, executor, repoRoot,submissionId));
+
             }
         } finally {
             executor.shutdown();
@@ -61,16 +61,20 @@ public class EvaluationService {
                 Thread.currentThread().interrupt();
             }
         }
-        logger.info(futureResults.toString());
+
+        logger.info("Submitted evaluation tasks: {}", futureResults.keySet());
         return futureResults;
     }
 
-    private Future<List<IssueItem>> submitFileEvaluation(
-            String repoRelPath, FileNode fileNode, EvaluationContext context, ExecutorService executor, Path repoRoot) {
-        return executor.submit(() -> evaluateFile(repoRelPath, fileNode, context, repoRoot));
+
+    private Future<Map<String, List<IssueItem>>> submitFileEvaluation(
+            String repoRelPath, FileNode fileNode, EvaluationContext context, ExecutorService executor, Path repoRoot,Long submissionId) {
+        return executor.submit(() -> evaluateFile(repoRelPath, fileNode, context, repoRoot,submissionId));
     }
 
-    private List<IssueItem> evaluateFile(String repoRelPath, FileNode fileNode, EvaluationContext context, Path repoRoot) {
+
+    private Map<String, List<IssueItem>> evaluateFile(String repoRelPath, FileNode fileNode, EvaluationContext context, Path repoRoot, Long submissionId) {
+
         try {
             String nodePath = fileNode.getPath(); // usually absolute from tree builder
             log.info("Evaluating file: {}", nodePath);
@@ -95,63 +99,62 @@ public class EvaluationService {
             );
 
             String systemPrompt = """
-            You are a code reviewer assistant. Please follow these instructions strictly:
-            - Provide feedback on errors, improvements, and things done right.
-            - Use a structured JSON format with keys: errors, improvements, thingsDoneRight.
-            - Each key should map to a list of issue objects with fields: message, filePath, lineNumber, severity.
-            - Do not include explanations outside the JSON structure.
-            - Use severity levels: ERROR, WARNING, INFO.
-            """;
+You are a code reviewer assistant. Please follow these instructions strictly:
+- Provide feedback on errors, improvements, and things done right.
+- Use a structured JSON format with keys: errors, improvements, thingsDoneRight.
+- Each key should map to a list of issue objects with fields: title, filePath, lineStart, lineEnd, severity, codeSnippet.
+- The field 'codeSnippet' must contain the exact code from the file, between lineStart and lineEnd (inclusive).
+- Only return a single JSON object first, with no additional explanation.
+- After the JSON object, provide a brief summary describing the **purpose and functionality of the file** — what this file is essentially doing or responsible for.
+- Use severity levels: ERROR, WARNING, INFO.
+""";
+
 
             long estTokens = estimateTokens(prompt.length() + systemPrompt.length());
             String response = groqClient.getCompletion(systemPrompt, prompt, 1024, 0.2);
             logger.info("LLM response length for {} = {}", repoRelPath, response == null ? 0 : response.length());
-            if (response != null) {
-                try {
-                    // Make a safe file name from repoRelPath
-                    String safeFileName = repoRelPath.replace("/", "_").replace("\\", "_");
 
-                    // Create the output file path inside the "llm_responses" directory
-                    Path logDir = Paths.get("llm_responses");
-                    Path logFile = logDir.resolve(safeFileName + ".txt");
 
-                    // Create the directory if it doesn't exist
-                    Files.createDirectories(logDir);
 
-                    // Write the full response to the file (overwrite if exists)
-                    Files.writeString(
-                            logFile,
-                            response,
-                            StandardOpenOption.CREATE,
-                            StandardOpenOption.TRUNCATE_EXISTING
-                    );
+            LlmResponseParser.ParsedResponse parsed = LlmResponseParser.parseLlmResponse(response);
+            Map<String, Object> evaluation = JsonParser.parseEvaluation(parsed.jsonPart);
 
-                    // Optional: Also print a short preview in the logs
-                    logger.info("LLM response saved for {} → {}", repoRelPath, logFile.toAbsolutePath());
-                } catch (IOException e) {
-                    logger.error("Failed to log LLM response for {}: {}", repoRelPath, e.getMessage());
+            if (!parsed.summaryPart.isEmpty()) {
+                boolean saved = projectStorageService.addSummaryToProjectFiles(submissionId, repoRelPath, parsed.summaryPart);
+
+                if (!saved) {
+                    // Handle save failure, logging, etc.
+                    throw new RuntimeException("Failed to add summary to project files for submission " + submissionId);
                 }
-            } else {
-                logger.warn("No response received for {}", repoRelPath);
             }
-
-            String cleanedResponse = stripJsonCodeFence(response);
-            Map<String, Object> evaluation = JsonParser.parseEvaluation(cleanedResponse);
             LLMLogger.saveParsedEvaluationToFile(evaluation, repoRelPath);
-            return flattenIssues(evaluation, repoRelPath);
+            return flattenIssuesWithCategories(evaluation, repoRelPath);
 
-        } catch (Exception e) {
+        }catch (Exception e) {
             log.error("Error evaluating file: {}", fileNode.getPath(), e);
+
+
             List<IssueItem> errorList = new ArrayList<>();
             errorList.add(new IssueItem(
                     "Failed to evaluate file: " + e.getMessage(),
                     repoRelPath,
                     null,
                     null,
+                    null,
                     IssueItem.IssueSeverity.ERROR
             ));
-            return errorList;
+
+            Map<String, List<IssueItem>> errorMap = new HashMap<>();
+            errorMap.put("errors", errorList);  // Put errors under the "errors" category
+
+            // You can add empty lists for other categories if needed:
+            errorMap.put("improvements", Collections.emptyList());
+            errorMap.put("thingsDoneRight", Collections.emptyList());
+
+            return errorMap;
         }
+
+
     }
 
     private String safeRead(Path repoRoot, String repoRelPath, String nodePath) throws Exception {
@@ -200,120 +203,79 @@ public class EvaluationService {
     private long estimateTokens(int chars) { return Math.max(1, chars / 4); }
 
     @SuppressWarnings("unchecked")
-    private List<IssueItem> flattenIssues(Map<String, Object> evaluation, String filePath) {
-        List<IssueItem> allIssues = new ArrayList<>();
-        if (evaluation == null) return allIssues;
+    private Map<String, List<IssueItem>> flattenIssuesWithCategories(Map<String, Object> evaluation, String filePath) {
+        Map<String, List<IssueItem>> categorizedIssues = new LinkedHashMap<>();
+        if (evaluation == null) return categorizedIssues;
 
-        if (evaluation.get("errors") instanceof Collection<?> col) {
-            for (Object v : col) if (v instanceof IssueItem ii) allIssues.add(ii);
-        } else if (evaluation.get("errors") instanceof Map<?,?> map) {
-            for (Object v : map.values()) if (v instanceof Collection<?> list) {
-                for (Object o : list) if (o instanceof IssueItem ii) allIssues.add(ii);
-            }
-        }
+        for (String category : List.of("errors", "improvements", "thingsDoneRight")) {
+            List<IssueItem> issuesInCategory = new ArrayList<>();
 
-        if (evaluation.get("improvements") instanceof Collection<?> col) {
-            for (Object v : col) if (v instanceof IssueItem ii) allIssues.add(ii);
-        } else if (evaluation.get("improvements") instanceof Map<?,?> map) {
-            for (Object v : map.values()) if (v instanceof Collection<?> list) {
-                for (Object o : list) if (o instanceof IssueItem ii) allIssues.add(ii);
-            }
-        }
+            Object val = evaluation.get(category);
 
-        if (evaluation.get("thingsDoneRight") instanceof Collection<?> col) {
-            for (Object v : col) if (v instanceof IssueItem ii) allIssues.add(ii);
-        } else if (evaluation.get("thingsDoneRight") instanceof Map<?,?> map) {
-            for (Object v : map.values()) if (v instanceof Collection<?> list) {
-                for (Object o : list) if (o instanceof IssueItem ii) allIssues.add(ii);
-            }
-        }
-
-        for (IssueItem ii : allIssues) {
-            if (ii.getFilePath() == null || ii.getFilePath().isBlank()) {
-                ii.setFilePath(filePath);
-            }
-        }
-        return allIssues;
-    }
-    public static String stripJsonCodeFence(String input) {
-        if (input == null) return "";
-
-        // Check if it starts with a code fence like ```json
-        if (input.startsWith("```json")) {
-            // Remove the first line (```json)
-            int firstNewline = input.indexOf('\n');
-            if (firstNewline >= 0) {
-                input = input.substring(firstNewline + 1);
-            }
-            // Remove trailing ``` if present
-            if (input.endsWith("```")) {
-                input = input.substring(0, input.length() - 3);
-            }
-        }
-        return input.trim();
-    }
-
-
-    public void saveEvaluationResultsToFiles(
-            Map<String, Future<List<IssueItem>>> futureResults,
-            Path outputDir,
-            int evaluationTimeoutSeconds) {
-
-        Logger logger = LoggerFactory.getLogger(getClass());
-
-        try {
-            if (!Files.exists(outputDir)) {
-                Files.createDirectories(outputDir);
-                logger.info("Created output directory: {}", outputDir.toAbsolutePath());
-            }
-        } catch (IOException e) {
-            logger.error("Failed to create output directory: {}", outputDir.toAbsolutePath(), e);
-            return;
-        }
-
-        for (Map.Entry<String, Future<List<IssueItem>>> entry : futureResults.entrySet()) {
-            String filePath = entry.getKey();
-            Future<List<IssueItem>> future = entry.getValue();
-
-            try {
-                List<IssueItem> issues = future.get(evaluationTimeoutSeconds, TimeUnit.SECONDS);
-
-                StringBuilder content = new StringBuilder();
-                content.append("Evaluation results for file: ").append(filePath).append("\n\n");
-
-                if (issues.isEmpty()) {
-                    content.append("No issues found.\n");
-                } else {
-                    for (IssueItem issue : issues) {
-                        content.append("- Description : ").append(issue.getDescription()).append("\n");
-                        content.append("  Severity    : ").append(issue.getSeverity()).append("\n");
-                        content.append("  File Path  : ").append(issue.getFilePath()).append("\n");
-                        content.append("  Line Number: ").append(issue.getLineNumber() != null ? issue.getLineNumber() : "N/A").append("\n");
-                        content.append("  Code Context:\n");
-                        if (issue.getCodeContext() != null && !issue.getCodeContext().isBlank()) {
-                            content.append(issue.getCodeContext()).append("\n");
-                        } else {
-                            content.append("  [No code context]\n");
-                        }
-                        content.append("\n");
+            if (val instanceof Collection<?> col) {
+                for (Object item : col) {
+                    if (item instanceof Map<?, ?> map) {
+                        issuesInCategory.add(convertMapToIssueItem((Map<String, Object>) map, filePath));
                     }
                 }
-
-                // Replace slashes/backslashes to avoid nested dirs in file name
-                String safeFileName = filePath.replaceAll("[/\\\\]", "_") + ".txt";
-                Path outputFile = outputDir.resolve(safeFileName);
-
-                Files.writeString(outputFile, content.toString(), StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-                logger.info("Saved evaluation results for '{}' to file: {}", filePath, outputFile.toAbsolutePath());
-
-            } catch (Exception e) {
-                logger.error("Failed to get or save evaluation result for file '{}'", filePath, e);
+            } else if (val instanceof Map<?, ?> nestedMap) {
+                for (Object nestedVal : nestedMap.values()) {
+                    if (nestedVal instanceof Collection<?> innerList) {
+                        for (Object obj : innerList) {
+                            if (obj instanceof Map<?, ?> innerMap) {
+                                issuesInCategory.add(convertMapToIssueItem((Map<String, Object>) innerMap, filePath));
+                            }
+                        }
+                    }
+                }
             }
+
+            categorizedIssues.put(category, issuesInCategory);
         }
+
+        return categorizedIssues;
     }
 
 
+    /**
+     * Converts a JSON-parsed map of an issue into an IssueItem object.
+     * Applies fallback file path and safely parses types.
+     */
+    private IssueItem convertMapToIssueItem(Map<String, Object> map, String fallbackFilePath) {
+        String title = (String) map.get("title");
+        String filePath = (String) map.getOrDefault("filePath", fallbackFilePath);
 
+        // Parse line numbers safely
+        Integer lineStart = (map.get("lineStart") instanceof Number) ? ((Number) map.get("lineStart")).intValue() : null;
+        Integer lineEnd = (map.get("lineEnd") instanceof Number) ? ((Number) map.get("lineEnd")).intValue() : null;
+
+        // Parse codeSnippet if present
+        String codeSnippet = (String) map.get("codeSnippet");
+
+        // Parse severity safely (default to MEDIUM if missing/invalid)
+        String severityRaw = (String) map.get("severity");
+        IssueItem.IssueSeverity severity = IssueItem.IssueSeverity.MEDIUM;
+        if (severityRaw != null) {
+            try {
+                severity = IssueItem.IssueSeverity.valueOf(severityRaw.toUpperCase());
+            } catch (IllegalArgumentException ignored) {
+                // Leave as MEDIUM
+            }
+        }
+
+        // Build and return the IssueItem
+        IssueItem issue = new IssueItem();
+        issue.setTitle(title);
+        issue.setFilePath(filePath);
+        issue.setLineStart(lineStart);
+        issue.setLineEnd(lineEnd);
+        issue.setCodeSnippet(codeSnippet);
+        issue.setSeverity(severity);
+        return issue;
+    }
+
+
+    
     // Placeholder parser; replace with your real one
     public static class JsonParser {
         public static Map<String, Object> parseEvaluation(String json) {

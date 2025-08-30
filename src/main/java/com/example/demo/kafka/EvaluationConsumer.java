@@ -45,7 +45,8 @@ public class EvaluationConsumer {
             EvaluationRequest evaluationRequest= objectMapper.readValue(reqMessage, EvaluationRequest.class);
             logger.info("Received JSON message from Kafka: {}", evaluationRequest);
             projectService.create(evaluationRequest.getTitle(), evaluationRequest.getSubmissionId());
-            evaluationService.evaluateRepositoryFromUrl(evaluationRequest.getRepoUrl(), evaluationRequest.getSubmissionId());
+            evaluationService.evaluateRepositoryFromUrl(evaluationRequest.getRepoUrl(), evaluationRequest.getSubmissionId(), evaluationRequest.getDescription());
+
 
         } catch (Exception e) {
             System.err.println("Req is not process send to retry pipeline : "+e.getMessage());

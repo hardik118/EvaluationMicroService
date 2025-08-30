@@ -113,6 +113,25 @@ public class FileNode {
                 || ext.equals("go") || ext.equals("cs") || ext.equals("php") || ext.equals("rb");
     }
 
+
+    /**
+     * Get the normalized relative path of this node.
+     * Assumes 'path' is relative to the root of the repo.
+     */
+    public String getRelativePath() {
+        return normalize(path);
+    }
+
+    private static String normalize(String p) {
+        if (p == null) return "";
+        String n = p.replace('\\', '/').trim();
+        if (n.startsWith("./")) n = n.substring(2);
+        if (n.startsWith("/")) n = n.substring(1);
+        if (n.endsWith("/") && n.length() > 1) n = n.substring(0, n.length() - 1);
+        return n;
+    }
+
+
     public boolean isConfigFile() {
         if (!isFile) return false;
         String name = getName().toLowerCase();

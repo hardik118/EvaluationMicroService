@@ -20,4 +20,9 @@ public class Project {
 
         @Column(nullable = false)
         private  String Name;
+
+    @Lob
+    @Column(columnDefinition = "TEXT")
+    private String repoSummary;
+
 }
