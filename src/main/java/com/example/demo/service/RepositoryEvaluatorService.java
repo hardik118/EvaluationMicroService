@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class RepositoryEvaluatorService {
 
+
     private final DependencyCheckAnalyzer dependencyCheckAnalyzer;
     private final GitUtils gitService;
     private final FeedbackProducer feedbackProducer;
@@ -47,6 +48,7 @@ public class RepositoryEvaluatorService {
 
 
 
+
     @Value("${evaluation.timeout.seconds:600}")
     private int evaluationTimeoutSeconds;
 
@@ -58,6 +60,7 @@ public class RepositoryEvaluatorService {
     private double rlTokens;
     private long rlLastRefillMs;
     private final ProjectStorageService projectStorageService;
+
 
     public RepositoryEvaluatorService(
             GitUtils gitService,
@@ -73,6 +76,7 @@ public class RepositoryEvaluatorService {
         this.projectService = projectService;
         this.groqClient = groqClient;
         this.projectStorageService = projectStorageService;
+
     }
 
 
@@ -99,7 +103,9 @@ public class RepositoryEvaluatorService {
                 throw new IllegalStateException("Cloned path is not a directory on disk: " + repoPath.toAbsolutePath());
             }
 
+
             EvaluationResult evaluationResult = evaluateRepository(repoPath, submissionId,  UserIntent);
+
             log.info("Evaluation result ready for submissionId={}", submissionId);
             feedbackProducer.produceFeedback(evaluationResult);
 
@@ -144,6 +150,7 @@ public class RepositoryEvaluatorService {
             // Build evaluation context from DB
             EvaluationContext context = EvaluationContext.fromRepoPath(repoPath, project, projectStorageService);
             log.info("\n{}", context.toPrettyString(25));
+
 
             // Submit files for evaluation via EvaluationService (returns futures)
             Map<String, Future<Map<String, List<IssueItem>>>> futureResults =
@@ -205,6 +212,7 @@ public class RepositoryEvaluatorService {
                 }
                 if (groupedIssues.containsKey("improvements")) {
                     for (IssueItem issue : groupedIssues.get("improvements")) {
+
                         addToMap(improvements, issue.getFilePath(), issue);
                     }
                 }
@@ -271,6 +279,7 @@ public class RepositoryEvaluatorService {
             String response = groqClient.getCompletion(systemPrompt, userPrompt, 1024, 0.3);
 
             // Step 5: Parse the response
+
             List<String> comments = new ArrayList<>();
             String[] lines = response.split("\n");
             boolean inCommentBlock = false;
@@ -295,6 +304,7 @@ public class RepositoryEvaluatorService {
                 comments.add("No evaluation could be generated.");
             }
 
+            ProgressLog.write("evaluation.overall", Map.of("comments", comments));
             return comments;
 
         } catch (Exception e) {

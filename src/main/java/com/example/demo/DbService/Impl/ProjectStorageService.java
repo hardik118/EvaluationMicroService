@@ -1,17 +1,18 @@
 package com.example.demo.DbService.Impl;
 
 import com.example.demo.DbModels.CodeFile;
-import com.example.demo.DbModels.Dto.FileSummaryProjection;
+
 import com.example.demo.DbModels.Folder;
 import com.example.demo.DbModels.Project;
 import com.example.demo.DbRepository.CodeFileRepository;
 import com.example.demo.DbRepository.FolderRepository;
-import com.example.demo.DbRepository.ProjectRepository;
+
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.*;
+
 import java.util.function.Consumer;
 
 @Service
@@ -21,6 +22,7 @@ public class ProjectStorageService {
     private final FolderRepository folderRepository;
     private final CodeFileRepository codeFileRepository;
     private final ProjectRepository projectRepository;
+
 
     /* ---------- Public API ---------- */
 
@@ -156,6 +158,7 @@ public class ProjectStorageService {
 
 
 
+
     @Transactional(readOnly = true)
     public List<CodeFile> listFiles(Project project) {
         return codeFileRepository.findAllByProjectWithTakingAndCallingFetched(project);
@@ -171,6 +174,7 @@ public class ProjectStorageService {
 
 
     }
+
 
     /* ---------- Deduped helpers ---------- */
 

@@ -3,6 +3,7 @@ package com.example.demo.utils;
 import com.example.demo.DbService.Impl.ProjectStorageService;
 import com.example.demo.model.EvaluationContext;
 import com.example.demo.model.IssueItem;
+
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -47,6 +48,7 @@ public class EvaluationService {
                 FileNode node = e.getValue();
                 // Submit the evaluation task returning Map<String, List<IssueItem>> per file
                 futureResults.put(repoRelPath, submitFileEvaluation(repoRelPath, node, context, executor, repoRoot,submissionId));
+
             }
         } finally {
             executor.shutdown();
@@ -72,6 +74,7 @@ public class EvaluationService {
 
 
     private Map<String, List<IssueItem>> evaluateFile(String repoRelPath, FileNode fileNode, EvaluationContext context, Path repoRoot, Long submissionId) {
+
         try {
             String nodePath = fileNode.getPath(); // usually absolute from tree builder
             log.info("Evaluating file: {}", nodePath);
@@ -107,8 +110,6 @@ You are a code reviewer assistant. Please follow these instructions strictly:
 """;
 
 
-
-
             long estTokens = estimateTokens(prompt.length() + systemPrompt.length());
             String response = groqClient.getCompletion(systemPrompt, prompt, 1024, 0.2);
             logger.info("LLM response length for {} = {}", repoRelPath, response == null ? 0 : response.length());
@@ -132,6 +133,7 @@ You are a code reviewer assistant. Please follow these instructions strictly:
         }catch (Exception e) {
             log.error("Error evaluating file: {}", fileNode.getPath(), e);
 
+
             List<IssueItem> errorList = new ArrayList<>();
             errorList.add(new IssueItem(
                     "Failed to evaluate file: " + e.getMessage(),
@@ -151,6 +153,7 @@ You are a code reviewer assistant. Please follow these instructions strictly:
 
             return errorMap;
         }
+
 
     }
 
@@ -272,6 +275,7 @@ You are a code reviewer assistant. Please follow these instructions strictly:
     }
 
 
+    
     // Placeholder parser; replace with your real one
     public static class JsonParser {
         public static Map<String, Object> parseEvaluation(String json) {

@@ -5,6 +5,7 @@ import com.example.demo.DbModels.Project;
 import com.example.demo.DbService.Impl.ProjectStorageService;
 import com.example.demo.utils.FileUtil;
 
+
 import java.nio.file.Path;
 import java.util.*;
 
@@ -52,6 +53,7 @@ public class EvaluationContext {
      */
     public static EvaluationContext fromCodeFiles(Collection<CodeFile> files) {
         EvaluationContext ctx = new EvaluationContext();
+
 
         if (files != null) {
             // Track paths without duplicates, preserving order
@@ -181,6 +183,7 @@ public class EvaluationContext {
 
     // -------- Debug/printing helpers --------
 
+
     @Override
     public String toString() {
         int edges = takingByFile.values().stream().mapToInt(Set::size).sum();
@@ -211,6 +214,7 @@ public class EvaluationContext {
 
         sb.append("\nCalling (first ").append(maxRows).append(" rows):\n");
         appendMapSample(sb, callingByFile, maxRows);
+
 
         sb.append("\nDependents (first ").append(maxRows).append(" rows):\n");
         appendMapSample(sb, dependentsByFile, maxRows);

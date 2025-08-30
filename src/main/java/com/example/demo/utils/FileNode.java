@@ -132,7 +132,6 @@ public class FileNode {
     }
 
 
-
     public boolean isConfigFile() {
         if (!isFile) return false;
         String name = getName().toLowerCase();
